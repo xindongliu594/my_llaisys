@@ -93,7 +93,10 @@ done
 Result: all public CPU operator cases passed for Float32, Float16, and
 BFloat16. This includes the Linear case with input shape `(512, 4096)` and
 weight shape `(4096, 4096)`. The complete Linear test finished in about nine
-seconds on the recorded environment. An additional local verification covered
+seconds on the initial implementation and about eight seconds after capping
+parallel execution at 64 threads and partitioning work by output element. This
+also enables parallel matrix-vector execution for single-token inference. An
+additional local verification covered
 the optional no-bias Linear path.
 
 The CPU runtime and Assignment #1 Tensor tests were also rerun successfully as

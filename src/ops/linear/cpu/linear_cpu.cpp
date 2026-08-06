@@ -10,19 +10,20 @@ template <typename T>
 void linear_(T *out, const T *in, const T *weight, const T *bias,
              size_t rows, size_t out_features, size_t in_features) {
     const size_t work = rows * out_features * in_features;
-    const size_t available_threads = std::max(1u, std::thread::hardware_concurrency());
-    const size_t thread_count = work < 1'000'000 ? 1 : std::min(rows, available_threads);
+    const size_t output_elements = rows * out_features;
+    const size_t available_threads = std::min<size_t>(64, std::max(1u, std::thread::hardware_concurrency()));
+    const size_t thread_count = work < 1'000'000 ? 1 : std::min(output_elements, available_threads);
 
     auto worker = [&](size_t worker_id) {
-        for (size_t row = worker_id; row < rows; row += thread_count) {
-            for (size_t col = 0; col < out_features; ++col) {
-                float sum = bias == nullptr ? 0.0f : llaisys::ops::cpu::toFloat(bias[col]);
-                for (size_t k = 0; k < in_features; ++k) {
-                    sum += llaisys::ops::cpu::toFloat(in[row * in_features + k])
-                        * llaisys::ops::cpu::toFloat(weight[col * in_features + k]);
-                }
-                out[row * out_features + col] = llaisys::ops::cpu::fromFloat<T>(sum);
+        for (size_t output_idx = worker_id; output_idx < output_elements; output_idx += thread_count) {
+            const size_t row = output_idx / out_features;
+            const size_t col = output_idx % out_features;
+            float sum = bias == nullptr ? 0.0f : llaisys::ops::cpu::toFloat(bias[col]);
+            for (size_t k = 0; k < in_features; ++k) {
+                sum += llaisys::ops::cpu::toFloat(in[row * in_features + k])
+                    * llaisys::ops::cpu::toFloat(weight[col * in_features + k]);
             }
+            out[output_idx] = llaisys::ops::cpu::fromFloat<T>(sum);
         }
     };
 
