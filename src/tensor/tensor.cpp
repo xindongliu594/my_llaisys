@@ -164,27 +164,93 @@ void Tensor::debug() const {
 }
 
 bool Tensor::isContiguous() const {
-    TO_BE_IMPLEMENTED();
+    ptrdiff_t expected_stride = 1;
+    for (size_t i = ndim(); i > 0; --i) {
+        const size_t dim = i - 1;
+        if (_meta.shape[dim] != 1 && _meta.strides[dim] != expected_stride) {
+            return false;
+        }
+        expected_stride *= static_cast<ptrdiff_t>(_meta.shape[dim]);
+    }
     return true;
 }
 
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    CHECK_ARGUMENT(order.size() == ndim(), "Permutation rank must match tensor rank");
+
+    std::vector<bool> seen(ndim(), false);
+    TensorMeta meta{_meta.dtype, std::vector<size_t>(ndim()), std::vector<ptrdiff_t>(ndim())};
+    for (size_t i = 0; i < ndim(); ++i) {
+        CHECK_ARGUMENT(order[i] < ndim(), "Permutation dimension is out of range");
+        CHECK_ARGUMENT(!seen[order[i]], "Permutation dimensions must be unique");
+        seen[order[i]] = true;
+        meta.shape[i] = _meta.shape[order[i]];
+        meta.strides[i] = _meta.strides[order[i]];
+    }
+    return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, _offset));
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    const size_t requested_numel = std::accumulate(shape.begin(), shape.end(), size_t(1), std::multiplies<size_t>());
+    CHECK_ARGUMENT(requested_numel == numel(), "View shape must preserve the number of elements");
+
+    std::vector<ptrdiff_t> new_strides(shape.size(), 1);
+    if (numel() != 0 && !shape.empty()) {
+        ptrdiff_t view_dim = static_cast<ptrdiff_t>(shape.size()) - 1;
+        ptrdiff_t chunk_base_stride = ndim() == 0 ? 1 : _meta.strides.back();
+        size_t tensor_numel = 1;
+        size_t view_numel = 1;
+
+        for (ptrdiff_t tensor_dim = static_cast<ptrdiff_t>(ndim()) - 1; tensor_dim >= 0; --tensor_dim) {
+            tensor_numel *= _meta.shape[tensor_dim];
+            const bool chunk_boundary = tensor_dim == 0
+                || (_meta.shape[tensor_dim - 1] != 1
+                    && _meta.strides[tensor_dim - 1]
+                        != static_cast<ptrdiff_t>(tensor_numel) * chunk_base_stride);
+
+            if (chunk_boundary) {
+                while (view_dim >= 0 && (view_numel < tensor_numel || shape[view_dim] == 1)) {
+                    new_strides[view_dim] = static_cast<ptrdiff_t>(view_numel) * chunk_base_stride;
+                    view_numel *= shape[view_dim];
+                    --view_dim;
+                }
+                CHECK_ARGUMENT(view_numel == tensor_numel, "View shape is incompatible with tensor strides");
+                if (tensor_dim > 0) {
+                    chunk_base_stride = _meta.strides[tensor_dim - 1];
+                    tensor_numel = 1;
+                    view_numel = 1;
+                }
+            }
+        }
+        CHECK_ARGUMENT(view_dim == -1, "View shape is incompatible with tensor strides");
+    } else {
+        ptrdiff_t stride = 1;
+        for (size_t i = shape.size(); i > 0; --i) {
+            new_strides[i - 1] = stride;
+            stride *= static_cast<ptrdiff_t>(shape[i - 1]);
+        }
+    }
+
+    TensorMeta meta{_meta.dtype, shape, std::move(new_strides)};
+    return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, _offset));
 }
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    CHECK_ARGUMENT(dim < ndim(), "Slice dimension is out of range");
+    CHECK_ARGUMENT(start <= end && end <= _meta.shape[dim], "Invalid slice range");
+
+    TensorMeta meta = _meta;
+    meta.shape[dim] = end - start;
+    const size_t offset = _offset
+        + start * static_cast<size_t>(_meta.strides[dim]) * elementSize();
+    return std::shared_ptr<Tensor>(new Tensor(std::move(meta), _storage, offset));
 }
 
 void Tensor::load(const void *src_) {
-    TO_BE_IMPLEMENTED();
+    CHECK_ARGUMENT(src_ != nullptr || numel() == 0, "Source pointer must not be null");
+    core::context().setDevice(deviceType(), deviceId());
+    const auto kind = deviceType() == LLAISYS_DEVICE_CPU ? LLAISYS_MEMCPY_H2H : LLAISYS_MEMCPY_H2D;
+    core::context().runtime().api()->memcpy_sync(data(), src_, numel() * elementSize(), kind);
 }
 
 tensor_t Tensor::contiguous() const {
