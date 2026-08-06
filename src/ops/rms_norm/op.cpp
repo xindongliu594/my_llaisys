@@ -1,7 +1,11 @@
 #include "op.hpp"
 
+#include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 #include "cpu/rms_norm_cpu.hpp"
+#ifdef ENABLE_NVIDIA_API
+#include "../nvidia_common.cuh"
+#endif
 
 namespace llaisys::ops {
 void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps) {
@@ -19,6 +23,15 @@ void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps) {
         return cpu::rmsNorm(out->data(), in->data(), weight->data(), out->dtype(),
                             in->shape()[0], in->shape()[1], eps);
     }
-    EXCEPTION_UNSUPPORTED_DEVICE;
+
+    llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
+    switch (out->deviceType()) {
+#ifdef ENABLE_NVIDIA_API
+    case LLAISYS_DEVICE_NVIDIA:
+        return nvidia::rmsNorm(out->data(), in->data(), weight->data(), out->dtype(),
+                               in->shape()[0], in->shape()[1], eps);
+#endif
+    default: EXCEPTION_UNSUPPORTED_DEVICE;
+    }
 }
 } // namespace llaisys::ops

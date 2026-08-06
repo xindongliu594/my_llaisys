@@ -180,5 +180,59 @@ python test/test_runtime.py --device cpu
 
 Result: the CUDA build completed successfully, one NVIDIA device was detected,
 and both the NVIDIA runtime test and the CPU regression test passed. CUDA
-operator kernels and end-to-end NVIDIA model inference are the next Assignment
-#4 milestones and are not claimed by this result.
+operator kernels and end-to-end NVIDIA model inference were completed in the
+following milestone.
+
+### NVIDIA CUDA operators and model inference
+
+- Implemented CUDA kernels for Add, Argmax, Embedding, RMSNorm, RoPE,
+  Self-Attention, and SwiGLU in Float32, Float16, and BFloat16.
+- Implemented block-level reductions for Argmax, RMSNorm, and numerically
+  stable causal grouped-query Self-Attention.
+- Implemented Linear with `cublasGemmEx`, FP32 accumulation, optional bias, and
+  tensor-core-capable Float16/BFloat16 execution.
+- Added NVIDIA dispatch without changing the default CPU-only build.
+- Fixed the Self-Attention reference test so its causal mask is created on the
+  same device as the CUDA tensors.
+
+All eight operator tests passed on NVIDIA for all three required data types,
+including the `(512, 4096) x (4096, 4096)` Linear case. Representative large
+case timings from the test benchmark are shown below; each value is the mean of
+100 launches with synchronization around the timed loop.
+
+| Operator / case | PyTorch (ms) | LLAISYS (ms) |
+| --- | ---: | ---: |
+| Add, `512 x 4096`, FP32 | 0.00476 | 0.00467 |
+| Argmax, `4096`, FP32 | 0.00483 | 0.00374 |
+| Embedding, `50 x 4096`, FP32 | 0.01156 | 0.00277 |
+| RMSNorm, `512 x 4096`, FP32 | 0.02436 | 0.00732 |
+| RoPE, `512 x 4 x 4096`, FP32 | 0.11198 | 0.02121 |
+| SwiGLU, `512 x 4096`, FP32 | 0.02193 | 0.00472 |
+| Self-Attention, `q=5, kv=11, h=4`, FP32 | 0.11240 | 0.00392 |
+| Linear, `512 x 4096 x 4096`, FP32 | 0.30145 | 0.30945 |
+| Linear, `512 x 4096 x 4096`, FP16 | 0.09454 | 0.09875 |
+| Linear, `512 x 4096 x 4096`, BF16 | 0.09349 | 0.09771 |
+
+End-to-end verification used the complete BF16
+`DeepSeek-R1-Distill-Qwen-1.5B` model:
+
+```bash
+python test/test_infer.py \
+    --model /root/models/DeepSeek-R1-Distill-Qwen-1.5B \
+    --device nvidia \
+    --test \
+    --max_steps 128
+```
+
+Result: passed. The generated token sequence matched Hugging Face exactly
+through EOS. For the measured generation section, Hugging Face took 1.72
+seconds and LLAISYS took 0.44 seconds on the same RTX 5090, a 3.91x speedup.
+The CPU runtime, Tensor, and all CPU operator tests passed again after the CUDA
+changes. A clean CPU-only build with `--nv-gpu=n` also succeeded.
+
+### Platform status
+
+- NVIDIA CUDA: Runtime, all required operators, and end-to-end model inference
+  complete and verified on RTX 5090.
+- Second CUDA-compatible platform: pending resource access; Assignment #4
+  requires one of Iluvatar, Metax, or Moore Threads in addition to NVIDIA.
