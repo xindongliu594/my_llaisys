@@ -59,3 +59,42 @@ python test/test_tensor.py
 
 Result: passed. Loading, viewing, permuting, slicing, shape/stride metadata, and
 element values all matched the PyTorch reference implementation.
+
+## Assignment #2: CPU operators
+
+Date: 2026-08-06
+
+### Implementation
+
+- Implemented Argmax with first-maximum tie behavior.
+- Implemented Embedding row lookup with index validation.
+- Implemented Linear with optional bias and parallel large-matrix execution.
+- Implemented RMSNorm with FP32 accumulation.
+- Implemented RoPE using position-dependent sine and cosine rotations.
+- Implemented causal self-attention with grouped-query head mapping and a
+  numerically stable softmax.
+- Implemented SwiGLU activation.
+- Added CPU dispatch, shape/dtype/device validation, and contiguous-layout
+  checks for all operators.
+- Added Float32, Float16, and BFloat16 support for every required operator.
+
+### Verification
+
+The repository does not contain the `test/test_ops.py` aggregate script named
+in the README, so all operator test files were run individually:
+
+```bash
+export PYTHONPATH="$PWD/python"
+for op in add argmax embedding linear rms_norm rope self_attention swiglu; do
+    python "test/ops/${op}.py" --device cpu
+done
+```
+
+Result: all public CPU operator cases passed for Float32, Float16, and
+BFloat16. This includes the Linear case with input shape `(512, 4096)` and
+weight shape `(4096, 4096)`. The complete Linear test finished in about nine
+seconds on the recorded environment. An additional local verification covered
+the optional no-bias Linear path.
+
+The CPU runtime and Assignment #1 Tensor tests were also rerun successfully as
+regression checks.
