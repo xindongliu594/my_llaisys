@@ -143,3 +143,42 @@ exactly through EOS. On the recorded 384-vCPU environment, Hugging Face took
 section. A reduced two-layer model was also used to verify raw safetensors
 loading, incremental cache updates, cache reset, and deterministic repeated
 generation before the full-model test.
+
+## Assignment #4: NVIDIA CUDA runtime milestone
+
+Date: 2026-08-06
+
+### Environment
+
+- GPU: NVIDIA GeForce RTX 5090 (32 GiB)
+- CUDA toolkit: 12.8
+- CUDA architecture selected by Xmake: `sm_120`
+
+### Implementation
+
+- Added the optional `llaisys-device-nvidia` CUDA build target, enabled with
+  `--nv-gpu=y`.
+- Implemented NVIDIA device discovery and selection, device synchronization,
+  CUDA stream creation/destruction/synchronization, device allocation, pinned
+  host allocation, and synchronous/asynchronous copies for all four transfer
+  directions.
+- Added CUDA error checking with operation-specific diagnostic messages.
+- Enabled Xmake device linking for the CUDA static library and emitted the
+  device-link object as position-independent code so it can be linked into
+  `libllaisys.so`.
+
+### Verification
+
+```bash
+xmake f -c --nv-gpu=y --cuda=/usr/local/cuda -m release
+xmake
+xmake install
+export PYTHONPATH="$PWD/python"
+python test/test_runtime.py --device nvidia
+python test/test_runtime.py --device cpu
+```
+
+Result: the CUDA build completed successfully, one NVIDIA device was detected,
+and both the NVIDIA runtime test and the CPU regression test passed. CUDA
+operator kernels and end-to-end NVIDIA model inference are the next Assignment
+#4 milestones and are not claimed by this result.
