@@ -101,3 +101,45 @@ the optional no-bias Linear path.
 
 The CPU runtime and Assignment #1 Tensor tests were also rerun successfully as
 regression checks.
+
+## Assignment #3: Qwen2 large-language-model inference
+
+Date: 2026-08-06
+
+### Implementation
+
+- Added a C ABI and ctypes bindings for model creation, destruction, weight
+  access, cache reset, and inference.
+- Implemented the complete Qwen2 decoder in C++, including token embedding,
+  pre-normalization, Q/K/V projections, RoPE, grouped-query causal attention,
+  residual connections, SwiGLU MLP blocks, final normalization, language-model
+  projection, and greedy Argmax decoding.
+- Implemented persistent per-layer K/V caches. Prompt tokens are processed as a
+  chunk and later generation calls process one new token while reusing cached
+  keys and values.
+- Implemented direct memory-mapped safetensors loading. Raw BF16 bytes are
+  copied into the C++ backend without using PyTorch for inference or weight
+  transformation.
+- Added deterministic cache reset between independent generation requests.
+- Added support for optional early termination at the configured EOS token.
+
+### Verification
+
+The specified `DeepSeek-R1-Distill-Qwen-1.5B` model was tested with greedy
+decoding:
+
+```bash
+export PYTHONPATH="$PWD/python"
+python test/test_infer.py \
+    --model /root/models/DeepSeek-R1-Distill-Qwen-1.5B \
+    --device cpu \
+    --test \
+    --max_steps 128
+```
+
+Result: passed. All generated token IDs matched the Hugging Face reference
+exactly through EOS. On the recorded 384-vCPU environment, Hugging Face took
+74.24 seconds and LLAISYS took 51.38 seconds for the measured generation
+section. A reduced two-layer model was also used to verify raw safetensors
+loading, incremental cache updates, cache reset, and deterministic repeated
+generation before the full-model test.
