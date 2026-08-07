@@ -234,5 +234,60 @@ changes. A clean CPU-only build with `--nv-gpu=n` also succeeded.
 
 - NVIDIA CUDA: Runtime, all required operators, and end-to-end model inference
   complete and verified on RTX 5090.
-- Second CUDA-compatible platform: pending resource access; Assignment #4
-  requires one of Iluvatar, Metax, or Moore Threads in addition to NVIDIA.
+- MetaX MACA: Runtime and all required operators complete and verified on C500;
+  end-to-end model inference is covered in the following milestone.
+
+## Assignment #4: MetaX MACA runtime and operators milestone
+
+Date: 2026-08-07
+
+### Environment
+
+- Accelerator: MetaX C500, 64 GiB physical memory
+- Container allocation: one sliced GPU, 50% compute and 32,000 MiB VRAM quota
+- Driver: 3.8.30
+- MACA: 3.3.0.15
+- Compiler: mxcc 1.0.0, native `XCORE1000` target
+- Reference framework: PyTorch 2.8.0 with MetaX 3.3.0.2 support
+
+### Implementation
+
+- Added a mutually exclusive `--metax-gpu=y` Xmake configuration while
+  preserving the existing CPU-only and `--nv-gpu=y` NVIDIA builds.
+- Added an mxcc toolchain using native MACA kernel compilation with
+  `-offload-arch native`.
+- Added a small source-compatibility layer mapping the CUDA Runtime API used by
+  LLAISYS to `mcRuntime`, Float16/BFloat16 types to MACA types, and cuBLAS calls
+  to `mcBLAS`.
+- Reused the already verified CUDA kernel algorithms through MetaX-specific
+  compilation entry points instead of maintaining a divergent copy of every
+  operator.
+- Linked `libllaisys.so` with `libmcruntime` and `libmcblas` and embedded the
+  MACA library rpath.
+
+### Build and verification
+
+```bash
+export XMAKE_ROOT=y
+xmake f -c -m release --nv-gpu=n --metax-gpu=y
+xmake build -j 16
+xmake install
+export PYTHONPATH="$PWD/python:$PWD"
+export LD_LIBRARY_PATH="/opt/maca/lib:/opt/mxdriver/lib:$LD_LIBRARY_PATH"
+python test/test_runtime.py --device nvidia
+python test/ops/add.py --device nvidia
+python test/ops/argmax.py --device nvidia
+python test/ops/embedding.py --device nvidia
+python test/ops/linear.py --device nvidia
+python test/ops/rms_norm.py --device nvidia
+python test/ops/rope.py --device nvidia
+python test/ops/self_attention.py --device nvidia
+python test/ops/swiglu.py --device nvidia
+```
+
+Result: the MACA build succeeded, one accelerator was detected, and the
+Runtime plus all eight operators passed for Float32, Float16, and BFloat16.
+This includes the large `(512, 4096) x (4096, 4096)` Linear cases. Before the
+accelerator port, a clean CPU-only build on the same container passed Runtime,
+Tensor, and all CPU operator tests, establishing that Assignments #0-#2
+reproduce correctly on the new platform.

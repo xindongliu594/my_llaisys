@@ -1,5 +1,7 @@
 add_rules("mode.debug", "mode.release")
-set_encodings("utf-8")
+if not has_config("metax-gpu") then
+    set_encodings("utf-8")
+end
 
 add_includedirs("include")
 
@@ -16,6 +18,24 @@ option_end()
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
     includes("xmake/nvidia.lua")
+end
+
+-- MetaX MACA --
+option("metax-gpu")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Whether to compile CUDA-compatible implementations for MetaX MACA")
+option_end()
+
+if has_config("nv-gpu") and has_config("metax-gpu") then
+    raise("The Nvidia CUDA and MetaX MACA backends are mutually exclusive")
+end
+
+if has_config("metax-gpu") then
+    -- The public assignment API names CUDA-like accelerators NVIDIA. Keep that
+    -- ABI while providing the implementation through MACA/mcBLAS.
+    add_defines("ENABLE_NVIDIA_API", "ENABLE_METAX_BACKEND")
+    includes("xmake/metax.lua")
 end
 
 target("llaisys-utils")
@@ -37,7 +57,7 @@ target("llaisys-device")
     set_kind("static")
     add_deps("llaisys-utils")
     add_deps("llaisys-device-cpu")
-    if has_config("nv-gpu") then
+    if has_config("nv-gpu") or has_config("metax-gpu") then
         add_deps("llaisys-device-nvidia")
     end
 
@@ -86,7 +106,7 @@ target_end()
 target("llaisys-ops")
     set_kind("static")
     add_deps("llaisys-ops-cpu")
-    if has_config("nv-gpu") then
+    if has_config("nv-gpu") or has_config("metax-gpu") then
         add_deps("llaisys-ops-nvidia")
     end
 
@@ -113,6 +133,12 @@ target("llaisys")
     set_warnings("all", "error")
     add_files("src/llaisys/*.cc")
     set_installdir(".")
+
+    if has_config("metax-gpu") then
+        add_linkdirs("/opt/maca/lib")
+        add_links("mcblas", "mcruntime")
+        add_rpathdirs("/opt/maca/lib")
+    end
 
     
     after_install(function (target)
