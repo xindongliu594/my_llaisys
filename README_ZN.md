@@ -347,6 +347,21 @@ xmake install
 python test/test_runtime.py --device nvidia
 ```
 
+在沐曦 MACA 平台上，使用独立的 ``--metax-gpu=y`` 开关。课程的公开
+设备枚举把 CUDA 类平台统一表示为 ``nvidia``，因此测试参数仍写
+``--device nvidia``：
+
+```bash
+export XMAKE_ROOT=y
+export MACA_PATH=/opt/maca
+export LD_LIBRARY_PATH="/opt/maca/lib:/opt/mxdriver/lib:$LD_LIBRARY_PATH"
+xmake f -c -m release --nv-gpu=n --metax-gpu=y
+xmake build
+xmake install
+export PYTHONPATH="$PWD/python:$PWD"
+python test/test_runtime.py --device nvidia
+```
+
 ### 实现 CUDA 算子
 
 在每个算子目录下新建 ``nvidia/`` 子目录，写 CUDA 版本实现。参考 ``src/ops/add/op.cpp`` 看如何包含 CUDA 实现。别忘了在 xmake 文件中定义编译流程。用 ``--device nvidia`` 参数运行测试。

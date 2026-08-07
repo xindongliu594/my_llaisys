@@ -348,6 +348,21 @@ xmake install
 python test/test_runtime.py --device nvidia
 ```
 
+On MetaX MACA, enable the separate `--metax-gpu=y` build. The public course
+ABI represents CUDA-like accelerators with the `nvidia` device value, so the
+test argument remains `--device nvidia`:
+
+```bash
+export XMAKE_ROOT=y
+export MACA_PATH=/opt/maca
+export LD_LIBRARY_PATH="/opt/maca/lib:/opt/mxdriver/lib:$LD_LIBRARY_PATH"
+xmake f -c -m release --nv-gpu=n --metax-gpu=y
+xmake build
+xmake install
+export PYTHONPATH="$PWD/python:$PWD"
+python test/test_runtime.py --device nvidia
+```
+
 ### Implement CUDA Operators
 Create a `nvdia/` sub-directory in each operator source directory and implement a cuda version. Check `src/ops/add/op.cpp` to see how to include your cuda implementations. Remeber to define the compiling procedures in the xmake files. Run the operator tests with `--device nvidia` flag to test your CUDA implementation.
 

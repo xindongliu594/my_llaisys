@@ -291,3 +291,44 @@ This includes the large `(512, 4096) x (4096, 4096)` Linear cases. Before the
 accelerator port, a clean CPU-only build on the same container passed Runtime,
 Tensor, and all CPU operator tests, establishing that Assignments #0-#2
 reproduce correctly on the new platform.
+
+### Performance verification
+
+Each value below is the mean of 100 synchronized launches after 10 warmup
+iterations. The large Linear result includes a MetaX-specific compatibility
+mapping from CUDA's FP32 pedantic mode to standard mcBLAS FP32 accumulation.
+The standard mode still passes the numerical tests and reduces LLAISYS FP32
+Linear latency from 16.31 ms to 0.643 ms.
+
+| Operator / case | MetaX PyTorch (ms) | LLAISYS (ms) |
+| --- | ---: | ---: |
+| Add, `512 x 4096`, FP32 | 0.02288 | 0.03455 |
+| Argmax, `4096`, FP32 | 0.01301 | 0.01456 |
+| Embedding, `50 x 4096`, FP32 | 0.05417 | 0.01907 |
+| RMSNorm, `512 x 4096`, FP32 | 0.08539 | 0.03575 |
+| RoPE, `512 x 4 x 4096`, FP32 | 0.35895 | 0.17130 |
+| SwiGLU, `512 x 4096`, FP32 | 0.09300 | 0.03453 |
+| Self-Attention, `q=5, kv=11, h=4`, FP32 | 0.14996 | 0.01465 |
+| Linear, `512 x 4096 x 4096`, FP32 | 0.60225 | 0.64319 |
+| Linear, `512 x 4096 x 4096`, FP16 | 0.14869 | 0.17653 |
+| Linear, `512 x 4096 x 4096`, BF16 | 0.14974 | 0.17651 |
+
+### MetaX end-to-end model inference
+
+The full BF16 `DeepSeek-R1-Distill-Qwen-1.5B` model was loaded from its raw
+safetensors weights and tested with greedy decoding:
+
+```bash
+export MACA_PATH=/opt/maca
+python test/test_infer.py \
+    --model /root/models/DeepSeek-R1-Distill-Qwen-1.5B \
+    --device nvidia \
+    --test \
+    --max_steps 128
+```
+
+Result: passed. LLAISYS generated exactly the same token IDs as the MetaX
+PyTorch reference through EOS. On the 50% C500 slice, the measured generation
+section took 2.75 seconds in PyTorch and 1.00 second in LLAISYS, a 2.75x
+speedup. Assignment #4 is therefore complete on two CUDA-like platforms:
+NVIDIA RTX 5090 and MetaX C500.
