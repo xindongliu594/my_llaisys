@@ -81,6 +81,10 @@ class Qwen2:
             LIB_LLAISYS.llaisysQwen2ModelDestroy(self._model)
             self._model = None
 
+    @property
+    def eos_token_id(self) -> int:
+        return self._end_token
+
     def _weight_handle(self, weights, name: str):
         if name == "model.embed_tokens.weight":
             return weights.in_embed

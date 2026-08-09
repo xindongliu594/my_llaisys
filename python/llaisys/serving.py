@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import queue
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Deque, Dict, Iterator, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 
 class GenerationModel(Protocol):
@@ -38,6 +40,15 @@ class RequestStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class FinishReason(str, Enum):
+    EOS = "eos"
+    STOP = "stop"
+    LENGTH = "length"
+    CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+
+
 @dataclass
 class GenerationRequest:
     request_id: str
@@ -45,8 +56,14 @@ class GenerationRequest:
     input_tokens: Tuple[int, ...]
     max_new_tokens: int
     priority: int = 0
+    stop_token_ids: Tuple[int, ...] = ()
+    timeout_seconds: Optional[float] = None
     status: RequestStatus = RequestStatus.WAITING
+    finish_reason: Optional[FinishReason] = None
+    cancel_requested: bool = False
     context_length: Optional[int] = None
+    context_tokens: Optional[Tuple[int, ...]] = None
+    generated_token_ids: List[int] = field(default_factory=list)
     output_tokens: Optional[Tuple[int, ...]] = None
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
@@ -54,10 +71,30 @@ class GenerationRequest:
     finished_at: Optional[float] = None
 
     @property
-    def generated_tokens(self) -> Optional[Tuple[int, ...]]:
-        if self.output_tokens is None or self.context_length is None:
+    def generated_tokens(self) -> Tuple[int, ...]:
+        if self.generated_token_ids:
+            return tuple(self.generated_token_ids)
+        if self.output_tokens is not None and self.context_length is not None:
+            return self.output_tokens[self.context_length :]
+        return ()
+
+    @property
+    def deadline(self) -> Optional[float]:
+        if self.timeout_seconds is None:
             return None
-        return self.output_tokens[self.context_length :]
+        return self.created_at + self.timeout_seconds
+
+
+@dataclass(frozen=True)
+class TokenEvent:
+    request_id: str
+    session_id: str
+    token_id: Optional[int] = None
+    text: Optional[str] = None
+    finished: bool = False
+    finish_reason: Optional[FinishReason] = None
+    error: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -230,6 +267,10 @@ class RequestPool:
                 for request in self._requests.values()
             )
 
+    def requests(self) -> List[GenerationRequest]:
+        with self._lock:
+            return list(self._requests.values())
+
 
 class RequestScheduler:
     """Schedules requests on one Qwen2 model instance.
@@ -260,11 +301,16 @@ class RequestScheduler:
         max_new_tokens: int = 128,
         priority: int = 0,
         request_id: Optional[str] = None,
+        stop_token_ids: Sequence[int] = (),
+        timeout_seconds: Optional[float] = None,
     ) -> GenerationRequest:
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
         tokens = tuple(int(token) for token in input_tokens)
         priority = int(priority)
+        stop_tokens = tuple(int(token) for token in stop_token_ids)
         self.sessions.acquire(session_id)
         request = GenerationRequest(
             request_id=request_id or uuid.uuid4().hex,
@@ -272,6 +318,8 @@ class RequestScheduler:
             input_tokens=tokens,
             max_new_tokens=max_new_tokens,
             priority=priority,
+            stop_token_ids=stop_tokens,
+            timeout_seconds=timeout_seconds,
         )
         try:
             self.request_pool.submit(request)
@@ -332,3 +380,308 @@ class RequestScheduler:
             if request is None:
                 return completed
             completed.append(request)
+
+
+class RoundRobinScheduler(RequestScheduler):
+    """Function-first token scheduler with streaming and cancellation.
+
+    The current backend has one KV cache, so each token step recomputes the
+    selected request from its complete context. This is intentionally slow but
+    provides correct round-robin semantics without duplicating model weights.
+    A future multi-sequence backend can replace ``_generate_one`` while keeping
+    the request, session, and event APIs unchanged.
+    """
+
+    supports_continuous_batching = False
+
+    def __init__(
+        self,
+        model: GenerationModel,
+        sessions: Optional[SessionManager] = None,
+        request_pool: Optional[RequestPool] = None,
+        token_decoder: Optional[Callable[[int], str]] = None,
+        commit_partial_on_abort: bool = True,
+    ) -> None:
+        super().__init__(model, sessions=sessions, request_pool=request_pool)
+        self._active: Deque[str] = deque()
+        self._event_queues: Dict[str, "queue.Queue[TokenEvent]"] = {}
+        self._events_lock = threading.RLock()
+        self._wake_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._worker: Optional[threading.Thread] = None
+        self._token_decoder = token_decoder
+        self._commit_partial_on_abort = commit_partial_on_abort
+        self._eos_token_id = getattr(model, "eos_token_id", None)
+
+    def submit(
+        self,
+        session_id: str,
+        input_tokens: Sequence[int],
+        max_new_tokens: int = 128,
+        priority: int = 0,
+        request_id: Optional[str] = None,
+        stop_token_ids: Sequence[int] = (),
+        timeout_seconds: Optional[float] = None,
+    ) -> GenerationRequest:
+        request_id = request_id or uuid.uuid4().hex
+        with self._events_lock:
+            if request_id in self._event_queues:
+                raise ValueError(f"Request already exists: {request_id}")
+            self._event_queues[request_id] = queue.Queue()
+        try:
+            request = super().submit(
+                session_id=session_id,
+                input_tokens=input_tokens,
+                max_new_tokens=max_new_tokens,
+                priority=priority,
+                request_id=request_id,
+                stop_token_ids=stop_token_ids,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception:
+            with self._events_lock:
+                del self._event_queues[request_id]
+            raise
+        self._wake_event.set()
+        return request
+
+    def cancel(self, request_id: str) -> bool:
+        request = self.request_pool.get(request_id)
+        if request.status is RequestStatus.WAITING:
+            if not self.request_pool.cancel(request_id):
+                return False
+            request.finish_reason = FinishReason.CANCELLED
+            self.sessions.release(request.session_id)
+            self._publish(self._terminal_event(request))
+            return True
+        if request.status is RequestStatus.RUNNING:
+            request.cancel_requested = True
+            self._wake_event.set()
+            return True
+        return False
+
+    def step(self) -> Optional[TokenEvent]:
+        """Advances one active request by at most one generated token."""
+
+        with self._worker_lock:
+            self._admit_waiting()
+            while self._active:
+                request = self.request_pool.get(self._active.popleft())
+                if request.status is not RequestStatus.RUNNING:
+                    continue
+
+                if request.cancel_requested:
+                    return self._finalize_abort(request, FinishReason.CANCELLED)
+                if request.deadline is not None and time.time() >= request.deadline:
+                    return self._finalize_abort(request, FinishReason.TIMEOUT)
+
+                try:
+                    if request.context_tokens is None:
+                        context = tuple(
+                            self.sessions.build_context(
+                                request.session_id, request.input_tokens
+                            )
+                        )
+                        if not context:
+                            raise ValueError(
+                                "A generation request needs at least one token"
+                            )
+                        request.context_tokens = context
+                        request.context_length = len(context)
+
+                    token_id = self._generate_one(request)
+                    if request.cancel_requested:
+                        return self._finalize_abort(
+                            request, FinishReason.CANCELLED
+                        )
+                    if request.deadline is not None and time.time() >= request.deadline:
+                        return self._finalize_abort(request, FinishReason.TIMEOUT)
+
+                    request.generated_token_ids.append(token_id)
+                    text = (
+                        self._token_decoder(token_id)
+                        if self._token_decoder is not None
+                        else None
+                    )
+                    reason = self._finish_reason(request, token_id)
+                    if reason is not None:
+                        return self._finalize_success(
+                            request, reason, token_id=token_id, text=text
+                        )
+
+                    self._active.append(request.request_id)
+                    event = TokenEvent(
+                        request_id=request.request_id,
+                        session_id=request.session_id,
+                        token_id=token_id,
+                        text=text,
+                    )
+                    self._publish(event)
+                    return event
+                except Exception as error:
+                    return self._finalize_error(request, error)
+            return None
+
+    def run_until_idle_stream(self) -> Iterator[TokenEvent]:
+        """Runs synchronously and yields token or terminal events."""
+
+        while True:
+            event = self.step()
+            if event is None:
+                return
+            yield event
+
+    def events(
+        self, request_id: str, timeout: Optional[float] = None
+    ) -> Iterator[TokenEvent]:
+        """Consumes events for one request, normally while a worker is running."""
+
+        with self._events_lock:
+            try:
+                event_queue = self._event_queues[request_id]
+            except KeyError as error:
+                raise KeyError(f"Unknown request: {request_id}") from error
+        while True:
+            try:
+                event = event_queue.get(timeout=timeout)
+            except queue.Empty as error:
+                raise TimeoutError(
+                    f"Timed out waiting for request events: {request_id}"
+                ) from error
+            yield event
+            if event.finished:
+                return
+
+    def start(self) -> None:
+        """Starts the optional background worker."""
+
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._stop_event.clear()
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name="llaisys-round-robin-scheduler",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def stop(self, wait: bool = True) -> None:
+        """Stops the worker; queued requests remain available for a restart."""
+
+        self._stop_event.set()
+        self._wake_event.set()
+        if wait and self._worker is not None:
+            self._worker.join()
+
+    def cancel_all(self) -> None:
+        for request in self.request_pool.requests():
+            if request.status in (RequestStatus.WAITING, RequestStatus.RUNNING):
+                self.cancel(request.request_id)
+        while self.step() is not None:
+            pass
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            event = self.step()
+            if event is None:
+                self._wake_event.wait(timeout=0.05)
+                self._wake_event.clear()
+
+    def _admit_waiting(self) -> None:
+        while True:
+            request = self.request_pool.pop_next()
+            if request is None:
+                return
+            self._active.append(request.request_id)
+
+    def _generate_one(self, request: GenerationRequest) -> int:
+        inputs = request.context_tokens + tuple(request.generated_token_ids)
+        output = tuple(
+            int(token)
+            for token in self.model.generate(inputs, max_new_tokens=1, top_k=1)
+        )
+        if output[: len(inputs)] != inputs or len(output) != len(inputs) + 1:
+            raise RuntimeError(
+                "A token step must return its input followed by exactly one token"
+            )
+        return output[-1]
+
+    def _finish_reason(
+        self, request: GenerationRequest, token_id: int
+    ) -> Optional[FinishReason]:
+        if self._eos_token_id is not None and token_id == self._eos_token_id:
+            return FinishReason.EOS
+        if token_id in request.stop_token_ids:
+            return FinishReason.STOP
+        if len(request.generated_token_ids) >= request.max_new_tokens:
+            return FinishReason.LENGTH
+        return None
+
+    def _finalize_success(
+        self,
+        request: GenerationRequest,
+        reason: FinishReason,
+        token_id: Optional[int] = None,
+        text: Optional[str] = None,
+    ) -> TokenEvent:
+        request.status = RequestStatus.FINISHED
+        request.finish_reason = reason
+        request.output_tokens = request.context_tokens + tuple(
+            request.generated_token_ids
+        )
+        self.sessions.commit(request.session_id, request.output_tokens)
+        self.sessions.release(request.session_id)
+        request.finished_at = time.time()
+        event = TokenEvent(
+            request_id=request.request_id,
+            session_id=request.session_id,
+            token_id=token_id,
+            text=text,
+            finished=True,
+            finish_reason=reason,
+        )
+        self._publish(event)
+        return event
+
+    def _finalize_abort(
+        self, request: GenerationRequest, reason: FinishReason
+    ) -> TokenEvent:
+        request.status = RequestStatus.CANCELLED
+        request.finish_reason = reason
+        if request.context_tokens is not None:
+            request.output_tokens = request.context_tokens + tuple(
+                request.generated_token_ids
+            )
+            if self._commit_partial_on_abort:
+                self.sessions.commit(request.session_id, request.output_tokens)
+        self.sessions.release(request.session_id)
+        request.finished_at = time.time()
+        event = self._terminal_event(request)
+        self._publish(event)
+        return event
+
+    def _finalize_error(
+        self, request: GenerationRequest, error: Exception
+    ) -> TokenEvent:
+        request.status = RequestStatus.FAILED
+        request.finish_reason = FinishReason.ERROR
+        request.error = str(error)
+        self.sessions.release(request.session_id)
+        request.finished_at = time.time()
+        event = self._terminal_event(request)
+        self._publish(event)
+        return event
+
+    @staticmethod
+    def _terminal_event(request: GenerationRequest) -> TokenEvent:
+        return TokenEvent(
+            request_id=request.request_id,
+            session_id=request.session_id,
+            finished=True,
+            finish_reason=request.finish_reason,
+            error=request.error,
+        )
+
+    def _publish(self, event: TokenEvent) -> None:
+        with self._events_lock:
+            self._event_queues[event.request_id].put(event)

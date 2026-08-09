@@ -6,12 +6,15 @@ from .libllaisys import llaisysStream_t as Stream
 from .tensor import Tensor
 from .ops import Ops
 from .serving import (
+    FinishReason,
     GenerationRequest,
     RequestPool,
     RequestScheduler,
     RequestStatus,
+    RoundRobinScheduler,
     Session,
     SessionManager,
+    TokenEvent,
 )
 from . import models
 from .models import *
@@ -24,11 +27,14 @@ __all__ = [
     "Stream",
     "Tensor",
     "Ops",
+    "FinishReason",
     "GenerationRequest",
     "RequestPool",
     "RequestScheduler",
     "RequestStatus",
+    "RoundRobinScheduler",
     "Session",
     "SessionManager",
+    "TokenEvent",
     "models",
 ]

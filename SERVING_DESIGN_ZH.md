@@ -33,6 +33,55 @@
 
 因此，当前实现保证的是**多会话语义正确和统一排队**，不是多个会话在一个 GPU Batch 中并行 Decode。
 
+### 功能优先的逐 Token 调度
+
+`RoundRobinScheduler` 提供另一种运行方式：每轮只让一个活跃请求生成一个 Token，然后切换到下一个请求。
+
+```text
+请求 A -> Token A1
+请求 B -> Token B1
+请求 C -> Token C1
+请求 A -> Token A2
+...
+```
+
+由于底层还没有多序列 KV Cache，每个 Token 步骤都会使用“完整上下文 + 已生成 Token”重新执行 Prefill。这种实现计算量较大，但具备完整且可验证的功能语义：
+
+- 请求按优先级进入活跃队列，随后 Round-Robin 公平轮询；
+- 每生成一个 Token 立即产生 `TokenEvent`；
+- 支持同步生成器和后台工作线程；
+- 支持 EOS、用户指定 Stop Token、最大生成长度；
+- 支持等待中取消、生成中取消和超时；
+- 取消或超时时可保留已经流式返回的部分结果；
+- 后端错误不会污染上一次成功的会话历史。
+
+```python
+scheduler = llaisys.RoundRobinScheduler(
+    model,
+    token_decoder=lambda token_id: tokenizer.decode([token_id]),
+)
+scheduler.sessions.create("chat-1", user_id="user-1")
+scheduler.start()
+
+request = scheduler.submit(
+    "chat-1",
+    input_tokens=[101, 102, 103],
+    max_new_tokens=128,
+    stop_token_ids=[151643],
+    timeout_seconds=60,
+)
+
+for event in scheduler.events(request.request_id, timeout=5):
+    if event.text:
+        print(event.text, end="", flush=True)
+    if event.finished:
+        print("finish_reason:", event.finish_reason)
+
+scheduler.stop()
+```
+
+这个上层接口以后可以直接连接真正的 Batched Decode；届时只替换底层的一步生成逻辑，不需要改变请求、会话、取消和事件接口。
+
 ## 3. 使用示例
 
 ```python
