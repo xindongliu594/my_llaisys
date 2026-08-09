@@ -51,4 +51,5 @@ jobs:
     - name: Assignment-3
       run: |
         python test/test_serving.py
+        python test/test_sampling.py
         python test/test_infer.py --test

@@ -9,7 +9,7 @@ from typing import Sequence
 import numpy as np
 
 from ..libllaisys import DataType, DeviceType, LIB_LLAISYS
-from ..libllaisys.models import LlaisysQwen2Meta
+from ..libllaisys.models import LlaisysQwen2Meta, LlaisysSamplingConfig
 
 
 class Qwen2:
@@ -145,10 +145,17 @@ class Qwen2:
         top_k: int = 1,
         top_p: float = 0.8,
         temperature: float = 0.8,
+        repetition_penalty: float = 1.0,
+        seed: int = 0,
     ):
-        del top_p, temperature
-        if top_k != 1:
-            raise NotImplementedError("The assignment backend currently supports greedy decoding only")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+        if temperature <= 0.0:
+            raise ValueError("temperature must be positive")
+        if repetition_penalty <= 0.0:
+            raise ValueError("repetition_penalty must be positive")
         if max_new_tokens is None:
             max_new_tokens = 128
         output = [int(token) for token in inputs]
@@ -157,8 +164,23 @@ class Qwen2:
 
         LIB_LLAISYS.llaisysQwen2ModelReset(self._model)
         prompt = (ctypes.c_int64 * len(output))(*output)
+        sampling = LlaisysSamplingConfig(
+            temperature=float(temperature),
+            top_k=int(top_k),
+            top_p=float(top_p),
+            repetition_penalty=float(repetition_penalty),
+            seed=int(seed),
+        )
+        use_greedy = top_k == 1 and repetition_penalty == 1.0
+        infer = (
+            LIB_LLAISYS.llaisysQwen2ModelInfer
+            if use_greedy
+            else LIB_LLAISYS.llaisysQwen2ModelInferSample
+        )
         next_token = int(
-            LIB_LLAISYS.llaisysQwen2ModelInfer(self._model, prompt, len(output))
+            infer(self._model, prompt, len(output))
+            if use_greedy
+            else infer(self._model, prompt, len(output), ctypes.byref(sampling))
         )
         if next_token < 0:
             raise RuntimeError("Qwen2 backend inference failed during prefill")
@@ -168,8 +190,13 @@ class Qwen2:
                 break
             token = ctypes.c_int64(next_token)
             next_token = int(
-                LIB_LLAISYS.llaisysQwen2ModelInfer(
-                    self._model, ctypes.byref(token), 1
+                infer(self._model, ctypes.byref(token), 1)
+                if use_greedy
+                else infer(
+                    self._model,
+                    ctypes.byref(token),
+                    1,
+                    ctypes.byref(sampling),
                 )
             )
             if next_token < 0:

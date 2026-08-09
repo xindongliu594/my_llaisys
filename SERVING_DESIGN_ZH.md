@@ -114,6 +114,32 @@ copy = chat.import_session(data, session_id="study-chat-copy")
 
 结构化消息是会话的真实来源。当前每轮重新应用 Chat Template 并 Prefill 完整历史，所以速度不如持久化多序列 KV Cache，但不会因为手工拼接 Token 而破坏角色分隔符或对话格式。
 
+### C++ 采样后端
+
+Qwen2 C++ 后端支持以下生成参数：
+
+- `top_k=1`：保持课程要求的 Argmax 贪心解码；
+- `top_k=0`：不限制 Top-k 候选；
+- `top_p`：按累计概率截断候选集合；
+- `temperature`：调整概率分布；
+- `repetition_penalty`：对上下文中已经出现的 Token 施加重复惩罚；
+- `seed`：固定随机种子以获得可复现结果。
+
+```python
+request = chat.submit_message(
+    "study-chat",
+    "给我三个不同的解释。",
+    max_new_tokens=128,
+    top_k=50,
+    top_p=0.95,
+    temperature=0.8,
+    repetition_penalty=1.05,
+    seed=2026,
+)
+```
+
+为了保持 Python 包装层不承担模型推理逻辑，logits 转换、重复惩罚、Top-k、Top-p、Softmax 和随机选择全部在 C++ 中完成。功能优先版本将最终 logits 从加速器复制到主机后采样，因此跨 NVIDIA CUDA 与 MetaX MACA 使用同一套确定性逻辑，但性能不作为这一阶段目标。
+
 ## 3. 使用示例
 
 ```python

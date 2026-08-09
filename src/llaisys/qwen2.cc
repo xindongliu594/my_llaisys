@@ -13,8 +13,12 @@
 #include "../ops/swiglu/op.hpp"
 #include "../utils.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <memory>
+#include <random>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -39,6 +43,10 @@ struct LlaisysQwen2Model {
     LlaisysQwen2Weights weights{};
     std::vector<tensor_t> key_cache;
     std::vector<tensor_t> value_cache;
+    std::vector<int64_t> token_history;
+    std::mt19937_64 sampling_rng;
+    uint64_t sampling_seed = 0;
+    bool sampling_rng_initialized = false;
 
     LlaisysQwen2Model(const LlaisysQwen2Meta &meta_, llaisysDeviceType_t device_, int device_id_)
         : meta(meta_), device(device_), device_id(device_id_), cache_len(0) {
@@ -140,7 +148,7 @@ struct LlaisysQwen2Model {
             LLAISYS_MEMCPY_D2D);
     }
 
-    int64_t infer(const int64_t *token_ids, size_t token_count) {
+    tensor_t forward(const int64_t *token_ids, size_t token_count) {
         CHECK_ARGUMENT(token_ids != nullptr && token_count > 0, "Qwen2 inference requires input tokens");
         CHECK_ARGUMENT(cache_len + token_count <= meta.maxseq, "Qwen2 KV cache capacity exceeded");
 
@@ -206,11 +214,17 @@ struct LlaisysQwen2Model {
         }
 
         cache_len += token_count;
+        token_history.insert(token_history.end(), token_ids, token_ids + token_count);
         auto last_hidden = hidden->slice(0, token_count - 1, token_count);
         auto final_hidden = create({1, meta.hs});
         llaisys::ops::rms_norm(final_hidden, last_hidden, tensor(weights.out_norm_w), meta.epsilon);
         auto logits = create({1, meta.voc});
         llaisys::ops::linear(logits, final_hidden, tensor(weights.out_embed), nullptr);
+        return logits;
+    }
+
+    int64_t inferGreedy(const int64_t *token_ids, size_t token_count) {
+        auto logits = forward(token_ids, token_count);
         auto max_index = create({1}, LLAISYS_DTYPE_I64);
         auto max_value = create({1});
         llaisys::ops::argmax(max_index, max_value, logits->view({meta.voc}));
@@ -221,6 +235,113 @@ struct LlaisysQwen2Model {
             &result, max_index->data(), sizeof(result),
             device == LLAISYS_DEVICE_CPU ? LLAISYS_MEMCPY_H2H : LLAISYS_MEMCPY_D2H);
         return result;
+    }
+
+    std::vector<float> copyLogitsToHost(tensor_t logits) const {
+        const size_t count = logits->numel();
+        std::vector<std::byte> raw(count * logits->elementSize());
+        llaisys::core::context().setDevice(device, device_id);
+        llaisys::core::context().runtime().api()->memcpy_sync(
+            raw.data(), logits->data(), raw.size(),
+            device == LLAISYS_DEVICE_CPU ? LLAISYS_MEMCPY_H2H : LLAISYS_MEMCPY_D2H);
+
+        std::vector<float> scores(count);
+        switch (meta.dtype) {
+        case LLAISYS_DTYPE_F32: {
+            const auto *source = reinterpret_cast<const float *>(raw.data());
+            std::copy(source, source + count, scores.begin());
+            break;
+        }
+        case LLAISYS_DTYPE_F16: {
+            const auto *source = reinterpret_cast<const llaisys::fp16_t *>(raw.data());
+            for (size_t i = 0; i < count; ++i) {
+                scores[i] = llaisys::utils::cast<float>(source[i]);
+            }
+            break;
+        }
+        case LLAISYS_DTYPE_BF16: {
+            const auto *source = reinterpret_cast<const llaisys::bf16_t *>(raw.data());
+            for (size_t i = 0; i < count; ++i) {
+                scores[i] = llaisys::utils::cast<float>(source[i]);
+            }
+            break;
+        }
+        default: EXCEPTION_UNSUPPORTED_DATATYPE(meta.dtype);
+        }
+        return scores;
+    }
+
+    int64_t sample(tensor_t logits, const LlaisysSamplingConfig &config) {
+        CHECK_ARGUMENT(config.temperature > 0.0f, "Temperature must be positive");
+        CHECK_ARGUMENT(config.top_p > 0.0f && config.top_p <= 1.0f,
+                       "Top-p must be in (0, 1]");
+        CHECK_ARGUMENT(config.repetition_penalty > 0.0f,
+                       "Repetition penalty must be positive");
+
+        auto scores = copyLogitsToHost(logits);
+        const float inverse_temperature = 1.0f / config.temperature;
+        for (float &score : scores) {
+            score *= inverse_temperature;
+        }
+
+        if (config.repetition_penalty != 1.0f) {
+            std::unordered_set<int64_t> seen(token_history.begin(), token_history.end());
+            for (int64_t token : seen) {
+                if (token < 0 || static_cast<size_t>(token) >= scores.size()) {
+                    continue;
+                }
+                float &score = scores[static_cast<size_t>(token)];
+                score = score < 0.0f ? score * config.repetition_penalty
+                                     : score / config.repetition_penalty;
+            }
+        }
+
+        std::vector<size_t> indices(scores.size());
+        std::iota(indices.begin(), indices.end(), 0);
+        const size_t candidate_count = config.top_k == 0
+            ? indices.size()
+            : std::min(config.top_k, indices.size());
+        std::partial_sort(indices.begin(), indices.begin() + candidate_count, indices.end(),
+                          [&scores](size_t left, size_t right) {
+                              return scores[left] > scores[right];
+                          });
+        indices.resize(candidate_count);
+
+        const float maximum = scores[indices.front()];
+        std::vector<double> weights(candidate_count);
+        double total = 0.0;
+        for (size_t i = 0; i < candidate_count; ++i) {
+            weights[i] = std::exp(static_cast<double>(scores[indices[i]] - maximum));
+            total += weights[i];
+        }
+
+        size_t kept = candidate_count;
+        if (config.top_p < 1.0f) {
+            double cumulative = 0.0;
+            for (size_t i = 0; i < candidate_count; ++i) {
+                cumulative += weights[i] / total;
+                if (cumulative >= config.top_p) {
+                    kept = i + 1;
+                    break;
+                }
+            }
+        }
+
+        if (!sampling_rng_initialized || sampling_seed != config.seed) {
+            sampling_rng.seed(config.seed);
+            sampling_seed = config.seed;
+            sampling_rng_initialized = true;
+        }
+        std::discrete_distribution<size_t> distribution(weights.begin(), weights.begin() + kept);
+        return static_cast<int64_t>(indices[distribution(sampling_rng)]);
+    }
+
+    int64_t inferSample(const int64_t *token_ids, size_t token_count,
+                        const LlaisysSamplingConfig &config) {
+        if (config.top_k == 1 && config.repetition_penalty == 1.0f) {
+            return inferGreedy(token_ids, token_count);
+        }
+        return sample(forward(token_ids, token_count), config);
     }
 };
 
@@ -251,15 +372,28 @@ __C {
     void llaisysQwen2ModelReset(LlaisysQwen2Model *model) {
         if (model != nullptr) {
             model->cache_len = 0;
+            model->token_history.clear();
+            model->sampling_rng_initialized = false;
         }
     }
 
     int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
         try {
             CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
-            return model->infer(token_ids, ntoken);
+            return model->inferGreedy(token_ids, ntoken);
         } catch (...) {
             // Token ids are non-negative, so -1 is an unambiguous failure value.
+            return -1;
+        }
+    }
+
+    int64_t llaisysQwen2ModelInferSample(LlaisysQwen2Model *model, int64_t *token_ids,
+                                         size_t ntoken, const LlaisysSamplingConfig *config) {
+        try {
+            CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
+            CHECK_ARGUMENT(config != nullptr, "Sampling config must not be null");
+            return model->inferSample(token_ids, ntoken, *config);
+        } catch (...) {
             return -1;
         }
     }

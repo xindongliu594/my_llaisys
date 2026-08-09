@@ -31,6 +31,14 @@ __C {
 
     struct LlaisysQwen2Model;
 
+    struct LlaisysSamplingConfig {
+        float temperature;
+        size_t top_k;
+        float top_p;
+        float repetition_penalty;
+        uint64_t seed;
+    };
+
     __export struct LlaisysQwen2Model *llaisysQwen2ModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice);
 
     __export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model * model);
@@ -40,5 +48,7 @@ __C {
     __export void llaisysQwen2ModelReset(struct LlaisysQwen2Model * model);
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
+
+    __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken, const LlaisysSamplingConfig * config);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

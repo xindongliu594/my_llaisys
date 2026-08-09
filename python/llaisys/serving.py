@@ -29,6 +29,8 @@ class GenerationModel(Protocol):
         top_k: int = 1,
         top_p: float = 0.8,
         temperature: float = 0.8,
+        repetition_penalty: float = 1.0,
+        seed: int = 0,
     ) -> Sequence[int]: ...
 
 
@@ -71,6 +73,11 @@ class GenerationRequest:
     input_tokens: Tuple[int, ...]
     max_new_tokens: int
     priority: int = 0
+    top_k: int = 1
+    top_p: float = 0.8
+    temperature: float = 0.8
+    repetition_penalty: float = 1.0
+    seed: int = 0
     stop_token_ids: Tuple[int, ...] = ()
     timeout_seconds: Optional[float] = None
     status: RequestStatus = RequestStatus.WAITING
@@ -364,11 +371,26 @@ class RequestScheduler:
         request_id: Optional[str] = None,
         stop_token_ids: Sequence[int] = (),
         timeout_seconds: Optional[float] = None,
+        top_k: int = 1,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+        repetition_penalty: float = 1.0,
+        seed: int = 0,
     ) -> GenerationRequest:
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+        if temperature <= 0.0:
+            raise ValueError("temperature must be positive")
+        if repetition_penalty <= 0.0:
+            raise ValueError("repetition_penalty must be positive")
+        if not 0 <= seed < 2**64:
+            raise ValueError("seed must fit in an unsigned 64-bit integer")
         tokens = tuple(int(token) for token in input_tokens)
         priority = int(priority)
         stop_tokens = tuple(int(token) for token in stop_token_ids)
@@ -379,6 +401,11 @@ class RequestScheduler:
             input_tokens=tokens,
             max_new_tokens=max_new_tokens,
             priority=priority,
+            top_k=int(top_k),
+            top_p=float(top_p),
+            temperature=float(temperature),
+            repetition_penalty=float(repetition_penalty),
+            seed=int(seed),
             stop_token_ids=stop_tokens,
             timeout_seconds=timeout_seconds,
         )
@@ -414,7 +441,11 @@ class RequestScheduler:
                     for token in self.model.generate(
                         context,
                         max_new_tokens=request.max_new_tokens,
-                        top_k=1,
+                        top_k=request.top_k,
+                        top_p=request.top_p,
+                        temperature=request.temperature,
+                        repetition_penalty=request.repetition_penalty,
+                        seed=request.seed,
                     )
                 )
                 if output[: len(context)] != tuple(context):
@@ -483,6 +514,11 @@ class RoundRobinScheduler(RequestScheduler):
         request_id: Optional[str] = None,
         stop_token_ids: Sequence[int] = (),
         timeout_seconds: Optional[float] = None,
+        top_k: int = 1,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+        repetition_penalty: float = 1.0,
+        seed: int = 0,
     ) -> GenerationRequest:
         request_id = request_id or uuid.uuid4().hex
         with self._events_lock:
@@ -498,6 +534,11 @@ class RoundRobinScheduler(RequestScheduler):
                 request_id=request_id,
                 stop_token_ids=stop_token_ids,
                 timeout_seconds=timeout_seconds,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                seed=seed,
             )
         except Exception:
             with self._events_lock:
@@ -659,7 +700,15 @@ class RoundRobinScheduler(RequestScheduler):
         inputs = request.context_tokens + tuple(request.generated_token_ids)
         output = tuple(
             int(token)
-            for token in self.model.generate(inputs, max_new_tokens=1, top_k=1)
+            for token in self.model.generate(
+                inputs,
+                max_new_tokens=1,
+                top_k=request.top_k,
+                top_p=request.top_p,
+                temperature=request.temperature,
+                repetition_penalty=request.repetition_penalty,
+                seed=(request.seed + len(request.generated_token_ids)) % 2**64,
+            )
         )
         if output[: len(inputs)] != inputs or len(output) != len(inputs) + 1:
             raise RuntimeError(
@@ -797,6 +846,11 @@ class ChatService:
         request_id: Optional[str] = None,
         stop_token_ids: Sequence[int] = (),
         timeout_seconds: Optional[float] = None,
+        top_k: int = 1,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+        repetition_penalty: float = 1.0,
+        seed: int = 0,
     ) -> GenerationRequest:
         previous = self.scheduler.sessions.get(session_id)
         messages = previous.messages + [ChatMessage("user", str(content))]
@@ -820,6 +874,11 @@ class ChatService:
                 request_id=request_id,
                 stop_token_ids=stop_token_ids,
                 timeout_seconds=timeout_seconds,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                seed=seed,
             )
         except Exception:
             self.scheduler.sessions.replace_messages(
