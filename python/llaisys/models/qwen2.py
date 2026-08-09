@@ -156,9 +156,9 @@ class Qwen2:
         next_token = int(
             LIB_LLAISYS.llaisysQwen2ModelInfer(self._model, prompt, len(output))
         )
-        for _ in range(max_new_tokens):
+        for step in range(max_new_tokens):
             output.append(next_token)
-            if next_token == self._end_token:
+            if next_token == self._end_token or step + 1 == max_new_tokens:
                 break
             token = ctypes.c_int64(next_token)
             next_token = int(

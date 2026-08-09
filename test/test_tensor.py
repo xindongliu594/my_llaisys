@@ -25,7 +25,7 @@ def test_tensor():
     llaisys_tensor_view.debug()
     assert llaisys_tensor_view.shape() == torch_tensor_view.shape
     assert llaisys_tensor_view.strides() == torch_tensor_view.stride()
-    assert llaisys_tensor.is_contiguous() == torch_tensor.is_contiguous()
+    assert llaisys_tensor_view.is_contiguous() == torch_tensor_view.is_contiguous()
     assert check_equal(llaisys_tensor_view, torch_tensor_view)
 
     # Test permute
@@ -35,7 +35,7 @@ def test_tensor():
     llaisys_tensor_perm.debug()
     assert llaisys_tensor_perm.shape() == torch_tensor_perm.shape
     assert llaisys_tensor_perm.strides() == torch_tensor_perm.stride()
-    assert llaisys_tensor.is_contiguous() == torch_tensor.is_contiguous()
+    assert llaisys_tensor_perm.is_contiguous() == torch_tensor_perm.is_contiguous()
     assert check_equal(llaisys_tensor_perm, torch_tensor_perm)
 
     # Test slice
@@ -45,8 +45,23 @@ def test_tensor():
     llaisys_tensor_slice.debug()
     assert llaisys_tensor_slice.shape() == torch_tensor_slice.shape
     assert llaisys_tensor_slice.strides() == torch_tensor_slice.stride()
-    assert llaisys_tensor.is_contiguous() == torch_tensor.is_contiguous()
+    assert llaisys_tensor_slice.is_contiguous() == torch_tensor_slice.is_contiguous()
     assert check_equal(llaisys_tensor_slice, torch_tensor_slice)
+
+    # A permutation that only moves a singleton dimension remains contiguous.
+    print("===Test singleton-dimension contiguity===")
+    torch_singleton = torch.arange(6, dtype=torch_dtype("i64")).reshape(2, 1, 3)
+    llaisys_singleton = llaisys.Tensor(
+        (2, 1, 3), dtype=llaisys_dtype("i64"), device=llaisys_device("cpu")
+    )
+    llaisys_singleton.load(torch_singleton.data_ptr())
+    torch_singleton_perm = torch_singleton.permute(1, 0, 2)
+    llaisys_singleton_perm = llaisys_singleton.permute(1, 0, 2)
+    assert (
+        llaisys_singleton_perm.is_contiguous()
+        == torch_singleton_perm.is_contiguous()
+    )
+    assert check_equal(llaisys_singleton_perm, torch_singleton_perm)
 
 
 if __name__ == "__main__":

@@ -46,14 +46,7 @@ jobs:
     
     - name: Assignment-2
       run: |
-        python test/ops/add.py 
-        python test/ops/argmax.py
-        python test/ops/embedding.py
-        python test/ops/linear.py 
-        python test/ops/rms_norm.py
-        python test/ops/rope.py
-        python test/ops/self_attention.py
-        python test/ops/swiglu.py
+        python test/test_ops.py
 
     - name: Assignment-3
       run: |
