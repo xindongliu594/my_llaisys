@@ -82,6 +82,38 @@ scheduler.stop()
 
 这个上层接口以后可以直接连接真正的 Batched Decode；届时只替换底层的一步生成逻辑，不需要改变请求、会话、取消和事件接口。
 
+### 结构化消息与 Chat Template
+
+`ChatService` 在 Token 会话之上保存 `system`、`user`、`assistant` 三种结构化消息。每一轮生成前，它使用模型 Tokenizer 的 `apply_chat_template()` 重建完整对话输入；生成完成后，再把新回复写回该会话。
+
+```python
+chat = llaisys.ChatService(scheduler, tokenizer)
+chat.create_session(
+    "study-chat",
+    user_id="user-1",
+    system_prompt="你是一名计算机系统课程助教。",
+)
+
+request = chat.submit_message(
+    "study-chat",
+    "解释一下 GQA。",
+    max_new_tokens=128,
+)
+
+for event in chat.run_until_idle_stream():
+    if event.text:
+        print(event.text, end="", flush=True)
+```
+
+会话可以导出和重新导入，不依赖数据库：
+
+```python
+data = chat.export_session("study-chat")
+copy = chat.import_session(data, session_id="study-chat-copy")
+```
+
+结构化消息是会话的真实来源。当前每轮重新应用 Chat Template 并 Prefill 完整历史，所以速度不如持久化多序列 KV Cache，但不会因为手工拼接 Token 而破坏角色分隔符或对话格式。
+
 ## 3. 使用示例
 
 ```python

@@ -42,6 +42,30 @@ class StepModel:
         return context + [token]
 
 
+class FakeTokenizer:
+    def __init__(self):
+        self.conversations = []
+
+    def apply_chat_template(
+        self, conversation, add_generation_prompt=True, tokenize=False
+    ):
+        assert add_generation_prompt
+        assert not tokenize
+        copied = [dict(message) for message in conversation]
+        self.conversations.append(copied)
+        return "|".join(
+            f"{message['role']}:{message['content']}" for message in copied
+        ) + "|assistant:"
+
+    def encode(self, text):
+        assert text
+        return [1]
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        del skip_special_tokens
+        return " ".join(str(token) for token in token_ids)
+
+
 class ServingTest(unittest.TestCase):
     def test_priority_fifo_and_independent_sessions(self):
         model = FakeModel()
@@ -232,6 +256,70 @@ class RoundRobinServingTest(unittest.TestCase):
         self.assertEqual([event.token_id for event in events], [11, 12])
         self.assertEqual([event.text for event in events], ["<11>", "<12>"])
         self.assertTrue(events[-1].finished)
+
+
+class ChatServiceTest(unittest.TestCase):
+    def test_structured_messages_multi_turn_and_export_import(self):
+        tokenizer = FakeTokenizer()
+        scheduler = llaisys.RoundRobinScheduler(StepModel())
+        chat = llaisys.ChatService(scheduler, tokenizer)
+        chat.create_session(
+            "chat-1", user_id="user-1", system_prompt="Be concise"
+        )
+
+        first = chat.submit_message("chat-1", "Hello", max_new_tokens=2)
+        events = list(chat.run_until_idle_stream())
+
+        self.assertEqual(first.generated_tokens, (11, 12))
+        self.assertTrue(events[-1].finished)
+        session = scheduler.sessions.get("chat-1")
+        self.assertEqual(
+            [(message.role, message.content) for message in session.messages],
+            [
+                ("system", "Be concise"),
+                ("user", "Hello"),
+                ("assistant", "11 12"),
+            ],
+        )
+
+        second = chat.submit_message("chat-1", "Continue", max_new_tokens=1)
+        list(chat.run_until_idle_stream())
+        self.assertEqual(second.generated_tokens, (11,))
+        self.assertEqual(
+            [message["role"] for message in tokenizer.conversations[-1]],
+            ["system", "user", "assistant", "user"],
+        )
+
+        exported = chat.export_session("chat-1")
+        scheduler.sessions.delete("chat-1")
+        imported = chat.import_session(exported, session_id="chat-copy")
+        self.assertEqual(imported.user_id, "user-1")
+        self.assertEqual(
+            [message.as_dict() for message in imported.messages],
+            exported["messages"],
+        )
+
+    def test_background_chat_stream_finalizes_assistant_message(self):
+        tokenizer = FakeTokenizer()
+        scheduler = llaisys.RoundRobinScheduler(StepModel())
+        chat = llaisys.ChatService(scheduler, tokenizer)
+        chat.create_session("chat")
+        scheduler.start()
+        try:
+            request = chat.submit_message("chat", "Hello", max_new_tokens=1)
+            events = list(chat.events(request.request_id, timeout=2.0))
+        finally:
+            scheduler.stop()
+
+        self.assertTrue(events[-1].finished)
+        self.assertEqual(
+            scheduler.sessions.get("chat").messages[-1],
+            llaisys.ChatMessage("assistant", "11"),
+        )
+
+    def test_invalid_chat_role(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported chat role"):
+            llaisys.ChatMessage("tool", "not enabled yet")
 
 
 if __name__ == "__main__":

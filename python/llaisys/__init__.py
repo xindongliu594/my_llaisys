@@ -6,6 +6,8 @@ from .libllaisys import llaisysStream_t as Stream
 from .tensor import Tensor
 from .ops import Ops
 from .serving import (
+    ChatMessage,
+    ChatService,
     FinishReason,
     GenerationRequest,
     RequestPool,
@@ -27,6 +29,8 @@ __all__ = [
     "Stream",
     "Tensor",
     "Ops",
+    "ChatMessage",
+    "ChatService",
     "FinishReason",
     "GenerationRequest",
     "RequestPool",

@@ -32,6 +32,21 @@ class GenerationModel(Protocol):
     ) -> Sequence[int]: ...
 
 
+class ChatTokenizer(Protocol):
+    def apply_chat_template(
+        self,
+        conversation: Sequence[Mapping[str, str]],
+        add_generation_prompt: bool = True,
+        tokenize: bool = False,
+    ) -> object: ...
+
+    def encode(self, text: str) -> Sequence[int]: ...
+
+    def decode(
+        self, token_ids: Sequence[int], skip_special_tokens: bool = True
+    ) -> str: ...
+
+
 class RequestStatus(str, Enum):
     WAITING = "waiting"
     RUNNING = "running"
@@ -97,11 +112,25 @@ class TokenEvent:
     created_at: float = field(default_factory=time.time)
 
 
+@dataclass(frozen=True)
+class ChatMessage:
+    role: str
+    content: str
+
+    def __post_init__(self) -> None:
+        if self.role not in {"system", "user", "assistant"}:
+            raise ValueError(f"Unsupported chat role: {self.role}")
+
+    def as_dict(self) -> Dict[str, str]:
+        return {"role": self.role, "content": self.content}
+
+
 @dataclass
 class Session:
     session_id: str
     user_id: Optional[str] = None
     token_history: List[int] = field(default_factory=list)
+    messages: List[ChatMessage] = field(default_factory=list)
     metadata: Dict[str, object] = field(default_factory=dict)
     busy: bool = False
     created_at: float = field(default_factory=time.time)
@@ -120,6 +149,7 @@ class SessionManager:
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
         initial_tokens: Sequence[int] = (),
+        initial_messages: Sequence[ChatMessage] = (),
         metadata: Optional[Mapping[str, object]] = None,
     ) -> Session:
         session_id = session_id or uuid.uuid4().hex
@@ -130,6 +160,7 @@ class SessionManager:
                 session_id=session_id,
                 user_id=user_id,
                 token_history=[int(token) for token in initial_tokens],
+                messages=list(initial_messages),
                 metadata=dict(metadata or {}),
             )
             self._sessions[session_id] = session
@@ -154,6 +185,35 @@ class SessionManager:
             if session.busy:
                 raise RuntimeError(f"Session has a pending request: {session_id}")
             session.token_history.clear()
+            session.messages.clear()
+            session.updated_at = time.time()
+
+    def set_token_history(
+        self, session_id: str, token_history: Sequence[int]
+    ) -> None:
+        with self._lock:
+            session = self._require(session_id)
+            if session.busy:
+                raise RuntimeError(f"Session has a pending request: {session_id}")
+            session.token_history = [int(token) for token in token_history]
+            session.updated_at = time.time()
+
+    def append_message(self, session_id: str, role: str, content: str) -> None:
+        with self._lock:
+            session = self._require(session_id)
+            if session.busy:
+                raise RuntimeError(f"Session has a pending request: {session_id}")
+            session.messages.append(ChatMessage(role=role, content=str(content)))
+            session.updated_at = time.time()
+
+    def replace_messages(
+        self, session_id: str, messages: Sequence[ChatMessage]
+    ) -> None:
+        with self._lock:
+            session = self._require(session_id)
+            if session.busy:
+                raise RuntimeError(f"Session has a pending request: {session_id}")
+            session.messages = list(messages)
             session.updated_at = time.time()
 
     def delete(self, session_id: str) -> None:
@@ -203,6 +263,7 @@ class SessionManager:
         return replace(
             session,
             token_history=list(session.token_history),
+            messages=list(session.messages),
             metadata=dict(session.metadata),
         )
 
@@ -685,3 +746,161 @@ class RoundRobinScheduler(RequestScheduler):
     def _publish(self, event: TokenEvent) -> None:
         with self._events_lock:
             self._event_queues[event.request_id].put(event)
+
+
+class ChatService:
+    """Structured chat history on top of ``RoundRobinScheduler``.
+
+    Messages are the source of truth. Before each turn the complete conversation
+    is rendered with the tokenizer's chat template and re-encoded. This is slower
+    than reusing a per-session KV cache, but it keeps roles and conversations
+    correct while the backend still owns only one cache.
+    """
+
+    def __init__(
+        self, scheduler: RoundRobinScheduler, tokenizer: ChatTokenizer
+    ) -> None:
+        self.scheduler = scheduler
+        self.tokenizer = tokenizer
+        self._finalized_requests: set[str] = set()
+        self._finalize_lock = threading.RLock()
+        if self.scheduler._token_decoder is None:
+            self.scheduler._token_decoder = lambda token_id: self.tokenizer.decode(
+                [token_id], skip_special_tokens=False
+            )
+
+    def create_session(
+        self,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        metadata: Optional[Mapping[str, object]] = None,
+    ) -> Session:
+        messages = (
+            [ChatMessage("system", system_prompt)]
+            if system_prompt is not None
+            else []
+        )
+        return self.scheduler.sessions.create(
+            session_id=session_id,
+            user_id=user_id,
+            initial_messages=messages,
+            metadata=metadata,
+        )
+
+    def submit_message(
+        self,
+        session_id: str,
+        content: str,
+        max_new_tokens: int = 128,
+        priority: int = 0,
+        request_id: Optional[str] = None,
+        stop_token_ids: Sequence[int] = (),
+        timeout_seconds: Optional[float] = None,
+    ) -> GenerationRequest:
+        previous = self.scheduler.sessions.get(session_id)
+        messages = previous.messages + [ChatMessage("user", str(content))]
+        prompt = self.tokenizer.apply_chat_template(
+            [message.as_dict() for message in messages],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        if not isinstance(prompt, str):
+            raise TypeError("Chat tokenizer must return text when tokenize=False")
+        input_tokens = [int(token) for token in self.tokenizer.encode(prompt)]
+
+        self.scheduler.sessions.replace_messages(session_id, messages)
+        self.scheduler.sessions.set_token_history(session_id, ())
+        try:
+            return self.scheduler.submit(
+                session_id=session_id,
+                input_tokens=input_tokens,
+                max_new_tokens=max_new_tokens,
+                priority=priority,
+                request_id=request_id,
+                stop_token_ids=stop_token_ids,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception:
+            self.scheduler.sessions.replace_messages(
+                session_id, previous.messages
+            )
+            self.scheduler.sessions.set_token_history(
+                session_id, previous.token_history
+            )
+            raise
+
+    def events(
+        self, request_id: str, timeout: Optional[float] = None
+    ) -> Iterator[TokenEvent]:
+        for event in self.scheduler.events(request_id, timeout=timeout):
+            if event.finished:
+                self.finalize_message(request_id)
+            yield event
+
+    def run_until_idle_stream(self) -> Iterator[TokenEvent]:
+        for event in self.scheduler.run_until_idle_stream():
+            if event.finished:
+                self.finalize_message(event.request_id)
+            yield event
+
+    def finalize_message(self, request_id: str) -> Optional[ChatMessage]:
+        with self._finalize_lock:
+            if request_id in self._finalized_requests:
+                return None
+            request = self.scheduler.request_pool.get(request_id)
+            if request.status in (RequestStatus.WAITING, RequestStatus.RUNNING):
+                raise RuntimeError(f"Request has not finished: {request_id}")
+            self._finalized_requests.add(request_id)
+            if request.status is RequestStatus.FAILED or not request.generated_tokens:
+                return None
+            content = self.tokenizer.decode(
+                request.generated_tokens, skip_special_tokens=True
+            )
+            message = ChatMessage("assistant", content)
+            self.scheduler.sessions.append_message(
+                request.session_id, message.role, message.content
+            )
+            return message
+
+    def export_session(self, session_id: str) -> Dict[str, object]:
+        session = self.scheduler.sessions.get(session_id)
+        return {
+            "session_id": session.session_id,
+            "user_id": session.user_id,
+            "messages": [message.as_dict() for message in session.messages],
+            "metadata": dict(session.metadata),
+            "created_at": session.created_at,
+            "updated_at": session.updated_at,
+        }
+
+    def import_session(
+        self,
+        data: Mapping[str, object],
+        session_id: Optional[str] = None,
+    ) -> Session:
+        raw_messages = data.get("messages", [])
+        if not isinstance(raw_messages, Sequence):
+            raise TypeError("messages must be a sequence")
+        messages: List[ChatMessage] = []
+        for item in raw_messages:
+            if not isinstance(item, Mapping):
+                raise TypeError("Each message must be a mapping")
+            messages.append(
+                ChatMessage(role=str(item["role"]), content=str(item["content"]))
+            )
+        metadata = data.get("metadata", {})
+        if not isinstance(metadata, Mapping):
+            raise TypeError("metadata must be a mapping")
+        imported_session_id = session_id or data.get("session_id")
+        imported_user_id = data.get("user_id")
+        return self.scheduler.sessions.create(
+            session_id=(
+                str(imported_session_id)
+                if imported_session_id is not None
+                else None
+            ),
+            user_id=(str(imported_user_id) if imported_user_id is not None else None),
+            initial_messages=messages,
+            metadata=metadata,
+        )
