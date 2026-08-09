@@ -156,6 +156,8 @@ class Qwen2:
         next_token = int(
             LIB_LLAISYS.llaisysQwen2ModelInfer(self._model, prompt, len(output))
         )
+        if next_token < 0:
+            raise RuntimeError("Qwen2 backend inference failed during prefill")
         for step in range(max_new_tokens):
             output.append(next_token)
             if next_token == self._end_token or step + 1 == max_new_tokens:
@@ -166,4 +168,6 @@ class Qwen2:
                     self._model, ctypes.byref(token), 1
                 )
             )
+            if next_token < 0:
+                raise RuntimeError("Qwen2 backend inference failed during decode")
         return output

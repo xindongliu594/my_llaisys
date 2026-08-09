@@ -229,9 +229,15 @@ __C {
                                                 llaisysDeviceType_t device,
                                                 int *device_ids,
                                                 int ndevice) {
-        CHECK_ARGUMENT(meta != nullptr, "Qwen2 metadata must not be null");
-        CHECK_ARGUMENT(ndevice == 1 && device_ids != nullptr, "Qwen2 currently supports exactly one device");
-        return new LlaisysQwen2Model(*meta, device, device_ids[0]);
+        try {
+            CHECK_ARGUMENT(meta != nullptr, "Qwen2 metadata must not be null");
+            CHECK_ARGUMENT(ndevice == 1 && device_ids != nullptr,
+                           "Qwen2 currently supports exactly one device");
+            return new LlaisysQwen2Model(*meta, device, device_ids[0]);
+        } catch (...) {
+            // C++ exceptions must never cross the C ABI boundary.
+            return nullptr;
+        }
     }
 
     void llaisysQwen2ModelDestroy(LlaisysQwen2Model *model) {
@@ -239,16 +245,22 @@ __C {
     }
 
     LlaisysQwen2Weights *llaisysQwen2ModelWeights(LlaisysQwen2Model *model) {
-        return &model->weights;
+        return model == nullptr ? nullptr : &model->weights;
     }
 
     void llaisysQwen2ModelReset(LlaisysQwen2Model *model) {
-        CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
-        model->cache_len = 0;
+        if (model != nullptr) {
+            model->cache_len = 0;
+        }
     }
 
     int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
-        CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
-        return model->infer(token_ids, ntoken);
+        try {
+            CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
+            return model->infer(token_ids, ntoken);
+        } catch (...) {
+            // Token ids are non-negative, so -1 is an unambiguous failure value.
+            return -1;
+        }
     }
 }

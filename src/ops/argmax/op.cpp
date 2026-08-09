@@ -24,13 +24,12 @@ void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals) {
     }
 
     llaisys::core::context().setDevice(vals->deviceType(), vals->deviceId());
-    switch (vals->deviceType()) {
 #ifdef ENABLE_NVIDIA_API
-    case LLAISYS_DEVICE_NVIDIA:
+    if (vals->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::argmax(reinterpret_cast<int64_t *>(max_idx->data()), max_val->data(),
                              vals->data(), vals->dtype(), vals->numel());
-#endif
-    default: EXCEPTION_UNSUPPORTED_DEVICE;
     }
+#endif
+    EXCEPTION_UNSUPPORTED_DEVICE;
 }
 } // namespace llaisys::ops

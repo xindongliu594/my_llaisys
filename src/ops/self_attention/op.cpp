@@ -33,15 +33,14 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
     }
 
     llaisys::core::context().setDevice(attn_val->deviceType(), attn_val->deviceId());
-    switch (attn_val->deviceType()) {
 #ifdef ENABLE_NVIDIA_API
-    case LLAISYS_DEVICE_NVIDIA:
+    if (attn_val->deviceType() == LLAISYS_DEVICE_NVIDIA) {
         return nvidia::selfAttention(attn_val->data(), q->data(), k->data(), v->data(),
                                      attn_val->dtype(), q->shape()[0], k->shape()[0],
                                      q->shape()[1], k->shape()[1], q->shape()[2],
                                      v->shape()[2], scale);
-#endif
-    default: EXCEPTION_UNSUPPORTED_DEVICE;
     }
+#endif
+    EXCEPTION_UNSUPPORTED_DEVICE;
 }
 } // namespace llaisys::ops
