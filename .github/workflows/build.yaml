@@ -52,4 +52,6 @@ jobs:
       run: |
         python test/test_serving.py
         python test/test_sampling.py
+        python -m py_compile python/llaisys/server.py python/llaisys/serve.py
+        python test/test_server.py
         python test/test_infer.py --test

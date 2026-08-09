@@ -18,6 +18,7 @@ from .serving import (
     SessionManager,
     TokenEvent,
 )
+from .server import OpenAIAPIServer, ServingMetrics
 from . import models
 from .models import *
 
@@ -40,5 +41,7 @@ __all__ = [
     "Session",
     "SessionManager",
     "TokenEvent",
+    "OpenAIAPIServer",
+    "ServingMetrics",
     "models",
 ]
