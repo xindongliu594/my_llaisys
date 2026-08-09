@@ -5,6 +5,14 @@ from .libllaisys import MemcpyKind
 from .libllaisys import llaisysStream_t as Stream
 from .tensor import Tensor
 from .ops import Ops
+from .serving import (
+    GenerationRequest,
+    RequestPool,
+    RequestScheduler,
+    RequestStatus,
+    Session,
+    SessionManager,
+)
 from . import models
 from .models import *
 
@@ -16,5 +24,11 @@ __all__ = [
     "Stream",
     "Tensor",
     "Ops",
+    "GenerationRequest",
+    "RequestPool",
+    "RequestScheduler",
+    "RequestStatus",
+    "Session",
+    "SessionManager",
     "models",
 ]
