@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import math
 import queue
 import threading
 import time
@@ -79,6 +80,8 @@ class GenerationRequest:
     repetition_penalty: float = 1.0
     seed: int = 0
     stop_token_ids: Tuple[int, ...] = ()
+    stop_strings: Tuple[str, ...] = ()
+    truncate_prompt: bool = False
     timeout_seconds: Optional[float] = None
     status: RequestStatus = RequestStatus.WAITING
     finish_reason: Optional[FinishReason] = None
@@ -86,6 +89,7 @@ class GenerationRequest:
     context_length: Optional[int] = None
     context_tokens: Optional[Tuple[int, ...]] = None
     generated_token_ids: List[int] = field(default_factory=list)
+    streamed_text: str = ""
     output_tokens: Optional[Tuple[int, ...]] = None
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
@@ -356,11 +360,20 @@ class RequestScheduler:
         model: GenerationModel,
         sessions: Optional[SessionManager] = None,
         request_pool: Optional[RequestPool] = None,
+        max_sequence_length: Optional[int] = None,
     ) -> None:
         self.model = model
         self.sessions = sessions or SessionManager()
         self.request_pool = request_pool or RequestPool()
         self._worker_lock = threading.Lock()
+        model_limit = getattr(model, "max_sequence_length", None)
+        self.max_sequence_length = (
+            int(max_sequence_length)
+            if max_sequence_length is not None
+            else (int(model_limit) if model_limit is not None else None)
+        )
+        if self.max_sequence_length is not None and self.max_sequence_length <= 0:
+            raise ValueError("max_sequence_length must be positive")
 
     def submit(
         self,
@@ -370,6 +383,8 @@ class RequestScheduler:
         priority: int = 0,
         request_id: Optional[str] = None,
         stop_token_ids: Sequence[int] = (),
+        stop_strings: Sequence[str] = (),
+        truncate_prompt: bool = False,
         timeout_seconds: Optional[float] = None,
         top_k: int = 1,
         top_p: float = 0.8,
@@ -377,23 +392,77 @@ class RequestScheduler:
         repetition_penalty: float = 1.0,
         seed: int = 0,
     ) -> GenerationRequest:
+        if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
+            raise ValueError("max_new_tokens must be an integer")
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
-        if timeout_seconds is not None and timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise ValueError("priority must be an integer")
+        if timeout_seconds is not None:
+            if isinstance(timeout_seconds, bool) or not isinstance(
+                timeout_seconds, (int, float)
+            ):
+                raise ValueError("timeout_seconds must be a number")
+            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                raise ValueError("timeout_seconds must be positive and finite")
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
+            raise ValueError("top_k must be an integer")
         if top_k < 0:
             raise ValueError("top_k must be non-negative")
-        if not 0.0 < top_p <= 1.0:
+        if (
+            isinstance(top_p, bool)
+            or not isinstance(top_p, (int, float))
+            or not math.isfinite(top_p)
+            or not 0.0 < top_p <= 1.0
+        ):
             raise ValueError("top_p must be in (0, 1]")
-        if temperature <= 0.0:
-            raise ValueError("temperature must be positive")
-        if repetition_penalty <= 0.0:
-            raise ValueError("repetition_penalty must be positive")
+        if (
+            isinstance(temperature, bool)
+            or not isinstance(temperature, (int, float))
+            or not math.isfinite(temperature)
+            or temperature <= 0.0
+        ):
+            raise ValueError("temperature must be positive and finite")
+        if (
+            isinstance(repetition_penalty, bool)
+            or not isinstance(repetition_penalty, (int, float))
+            or not math.isfinite(repetition_penalty)
+            or repetition_penalty <= 0.0
+        ):
+            raise ValueError("repetition_penalty must be positive and finite")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("seed must be an integer")
         if not 0 <= seed < 2**64:
             raise ValueError("seed must fit in an unsigned 64-bit integer")
-        tokens = tuple(int(token) for token in input_tokens)
-        priority = int(priority)
-        stop_tokens = tuple(int(token) for token in stop_token_ids)
+        if any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in input_tokens
+        ):
+            raise ValueError("input_tokens must contain non-negative integers")
+        if any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in stop_token_ids
+        ):
+            raise ValueError(
+                "stop_token_ids must contain non-negative integers"
+            )
+        if isinstance(stop_strings, (str, bytes)) or any(
+            not isinstance(stop, str) for stop in stop_strings
+        ):
+            raise ValueError("stop_strings must be a sequence of strings")
+        tokens = tuple(input_tokens)
+        stop_tokens = tuple(stop_token_ids)
+        normalized_stops = tuple(dict.fromkeys(stop_strings))
+        if any(not stop for stop in normalized_stops):
+            raise ValueError("stop strings must not be empty")
+        if not isinstance(truncate_prompt, bool):
+            raise ValueError("truncate_prompt must be a boolean")
+        session = self.sessions.get(session_id)
+        self._validate_context_length(
+            len(session.token_history) + len(tokens),
+            max_new_tokens,
+            truncate_prompt,
+        )
         self.sessions.acquire(session_id)
         request = GenerationRequest(
             request_id=request_id or uuid.uuid4().hex,
@@ -401,12 +470,14 @@ class RequestScheduler:
             input_tokens=tokens,
             max_new_tokens=max_new_tokens,
             priority=priority,
-            top_k=int(top_k),
+            top_k=top_k,
             top_p=float(top_p),
             temperature=float(temperature),
             repetition_penalty=float(repetition_penalty),
-            seed=int(seed),
+            seed=seed,
             stop_token_ids=stop_tokens,
+            stop_strings=normalized_stops,
+            truncate_prompt=truncate_prompt,
             timeout_seconds=timeout_seconds,
         )
         try:
@@ -415,6 +486,40 @@ class RequestScheduler:
             self.sessions.release(session_id)
             raise
         return request
+
+    def _validate_context_length(
+        self, context_length: int, max_new_tokens: int, truncate_prompt: bool
+    ) -> None:
+        if self.max_sequence_length is None:
+            return
+        available = self.max_sequence_length - max_new_tokens
+        if available <= 0:
+            raise ValueError(
+                "max_new_tokens must be smaller than max_sequence_length "
+                f"({self.max_sequence_length})"
+            )
+        if context_length > available and not truncate_prompt:
+            raise ValueError(
+                f"Prompt has {context_length} tokens, but at most {available} "
+                "tokens fit with the requested output; set truncate_prompt=true "
+                "to left-truncate the prompt"
+            )
+
+    def _build_context(self, request: GenerationRequest) -> Tuple[int, ...]:
+        context = tuple(
+            self.sessions.build_context(request.session_id, request.input_tokens)
+        )
+        if not context:
+            raise ValueError("A generation request needs at least one token")
+        if self.max_sequence_length is not None:
+            available = self.max_sequence_length - request.max_new_tokens
+            if len(context) > available:
+                if not request.truncate_prompt:
+                    self._validate_context_length(
+                        len(context), request.max_new_tokens, False
+                    )
+                context = context[-available:]
+        return context
 
     def cancel(self, request_id: str) -> bool:
         request = self.request_pool.get(request_id)
@@ -430,11 +535,7 @@ class RequestScheduler:
                 return None
 
             try:
-                context = self.sessions.build_context(
-                    request.session_id, request.input_tokens
-                )
-                if not context:
-                    raise ValueError("A generation request needs at least one token")
+                context = self._build_context(request)
                 request.context_length = len(context)
                 output = tuple(
                     int(token)
@@ -492,9 +593,16 @@ class RoundRobinScheduler(RequestScheduler):
         sessions: Optional[SessionManager] = None,
         request_pool: Optional[RequestPool] = None,
         token_decoder: Optional[Callable[[int], str]] = None,
+        sequence_decoder: Optional[Callable[[Sequence[int]], str]] = None,
         commit_partial_on_abort: bool = True,
+        max_sequence_length: Optional[int] = None,
     ) -> None:
-        super().__init__(model, sessions=sessions, request_pool=request_pool)
+        super().__init__(
+            model,
+            sessions=sessions,
+            request_pool=request_pool,
+            max_sequence_length=max_sequence_length,
+        )
         self._active: Deque[str] = deque()
         self._event_queues: Dict[str, "queue.Queue[TokenEvent]"] = {}
         self._events_lock = threading.RLock()
@@ -502,6 +610,7 @@ class RoundRobinScheduler(RequestScheduler):
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._token_decoder = token_decoder
+        self._sequence_decoder = sequence_decoder
         self._commit_partial_on_abort = commit_partial_on_abort
         self._eos_token_id = getattr(model, "eos_token_id", None)
 
@@ -513,6 +622,8 @@ class RoundRobinScheduler(RequestScheduler):
         priority: int = 0,
         request_id: Optional[str] = None,
         stop_token_ids: Sequence[int] = (),
+        stop_strings: Sequence[str] = (),
+        truncate_prompt: bool = False,
         timeout_seconds: Optional[float] = None,
         top_k: int = 1,
         top_p: float = 0.8,
@@ -533,6 +644,8 @@ class RoundRobinScheduler(RequestScheduler):
                 priority=priority,
                 request_id=request_id,
                 stop_token_ids=stop_token_ids,
+                stop_strings=stop_strings,
+                truncate_prompt=truncate_prompt,
                 timeout_seconds=timeout_seconds,
                 top_k=top_k,
                 top_p=top_p,
@@ -579,15 +692,7 @@ class RoundRobinScheduler(RequestScheduler):
 
                 try:
                     if request.context_tokens is None:
-                        context = tuple(
-                            self.sessions.build_context(
-                                request.session_id, request.input_tokens
-                            )
-                        )
-                        if not context:
-                            raise ValueError(
-                                "A generation request needs at least one token"
-                            )
+                        context = self._build_context(request)
                         request.context_tokens = context
                         request.context_length = len(context)
 
@@ -600,12 +705,12 @@ class RoundRobinScheduler(RequestScheduler):
                         return self._finalize_abort(request, FinishReason.TIMEOUT)
 
                     request.generated_token_ids.append(token_id)
-                    text = (
-                        self._token_decoder(token_id)
-                        if self._token_decoder is not None
-                        else None
-                    )
                     reason = self._finish_reason(request, token_id)
+                    text, stopped_by_string = self._decode_increment(
+                        request, force_flush=reason is not None
+                    )
+                    if stopped_by_string:
+                        reason = FinishReason.STOP
                     if reason is not None:
                         return self._finalize_success(
                             request, reason, token_id=token_id, text=text
@@ -623,6 +728,49 @@ class RoundRobinScheduler(RequestScheduler):
                 except Exception as error:
                     return self._finalize_error(request, error)
             return None
+
+    def _decode_increment(
+        self, request: GenerationRequest, force_flush: bool = False
+    ) -> Tuple[Optional[str], bool]:
+        if self._sequence_decoder is not None:
+            decoded = self._sequence_decoder(request.generated_token_ids)
+        elif self._token_decoder is not None:
+            decoded = "".join(
+                self._token_decoder(token)
+                for token in request.generated_token_ids
+            )
+        else:
+            return None, False
+
+        stop_positions = [
+            position
+            for stop in request.stop_strings
+            if (position := decoded.find(stop)) >= 0
+        ]
+        stopped = bool(stop_positions)
+        if stopped:
+            visible = decoded[: min(stop_positions)]
+        else:
+            visible = decoded
+            if request.stop_strings and not force_flush:
+                held = max(
+                    (
+                        size
+                        for stop in request.stop_strings
+                        for size in range(1, min(len(stop), len(decoded)) + 1)
+                        if decoded.endswith(stop[:size])
+                    ),
+                    default=0,
+                )
+                if held:
+                    visible = decoded[:-held]
+
+        if visible.startswith(request.streamed_text):
+            delta = visible[len(request.streamed_text) :]
+        else:
+            delta = visible
+        request.streamed_text = visible
+        return delta or None, stopped
 
     def run_until_idle_stream(self) -> Iterator[TokenEvent]:
         """Runs synchronously and yields token or terminal events."""
@@ -756,6 +904,7 @@ class RoundRobinScheduler(RequestScheduler):
     def _finalize_abort(
         self, request: GenerationRequest, reason: FinishReason
     ) -> TokenEvent:
+        text, _ = self._decode_increment(request, force_flush=True)
         request.status = RequestStatus.CANCELLED
         request.finish_reason = reason
         if request.context_tokens is not None:
@@ -766,27 +915,31 @@ class RoundRobinScheduler(RequestScheduler):
                 self.sessions.commit(request.session_id, request.output_tokens)
         self.sessions.release(request.session_id)
         request.finished_at = time.time()
-        event = self._terminal_event(request)
+        event = self._terminal_event(request, text=text)
         self._publish(event)
         return event
 
     def _finalize_error(
         self, request: GenerationRequest, error: Exception
     ) -> TokenEvent:
+        text, _ = self._decode_increment(request, force_flush=True)
         request.status = RequestStatus.FAILED
         request.finish_reason = FinishReason.ERROR
         request.error = str(error)
         self.sessions.release(request.session_id)
         request.finished_at = time.time()
-        event = self._terminal_event(request)
+        event = self._terminal_event(request, text=text)
         self._publish(event)
         return event
 
     @staticmethod
-    def _terminal_event(request: GenerationRequest) -> TokenEvent:
+    def _terminal_event(
+        request: GenerationRequest, text: Optional[str] = None
+    ) -> TokenEvent:
         return TokenEvent(
             request_id=request.request_id,
             session_id=request.session_id,
+            text=text,
             finished=True,
             finish_reason=request.finish_reason,
             error=request.error,
@@ -817,6 +970,10 @@ class ChatService:
             self.scheduler._token_decoder = lambda token_id: self.tokenizer.decode(
                 [token_id], skip_special_tokens=False
             )
+        if self.scheduler._sequence_decoder is None:
+            self.scheduler._sequence_decoder = lambda token_ids: self.tokenizer.decode(
+                token_ids, skip_special_tokens=True
+            )
 
     def create_session(
         self,
@@ -845,6 +1002,8 @@ class ChatService:
         priority: int = 0,
         request_id: Optional[str] = None,
         stop_token_ids: Sequence[int] = (),
+        stop_strings: Sequence[str] = (),
+        truncate_prompt: bool = False,
         timeout_seconds: Optional[float] = None,
         top_k: int = 1,
         top_p: float = 0.8,
@@ -873,6 +1032,8 @@ class ChatService:
                 priority=priority,
                 request_id=request_id,
                 stop_token_ids=stop_token_ids,
+                stop_strings=stop_strings,
+                truncate_prompt=truncate_prompt,
                 timeout_seconds=timeout_seconds,
                 top_k=top_k,
                 top_p=top_p,
@@ -913,9 +1074,7 @@ class ChatService:
             self._finalized_requests.add(request_id)
             if request.status is RequestStatus.FAILED or not request.generated_tokens:
                 return None
-            content = self.tokenizer.decode(
-                request.generated_tokens, skip_special_tokens=True
-            )
+            content = request.streamed_text
             message = ChatMessage("assistant", content)
             self.scheduler.sessions.append_message(
                 request.session_id, message.role, message.content

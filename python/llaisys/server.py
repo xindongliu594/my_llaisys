@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import threading
 import time
 import uuid
@@ -246,11 +247,17 @@ class OpenAIAPIServer:
                 self._text_completion(handler, body)
                 return
             if path == "/sessions":
+                session_id = self._optional_string(body, "session_id")
+                user_id = self._optional_string(body, "user_id")
+                system_prompt = self._optional_string(body, "system_prompt")
+                metadata = body.get("metadata")
+                if metadata is not None and not isinstance(metadata, Mapping):
+                    raise ValueError("metadata must be an object")
                 session = self.chat.create_session(
-                    session_id=body.get("session_id"),
-                    user_id=body.get("user_id"),
-                    system_prompt=body.get("system_prompt"),
-                    metadata=body.get("metadata"),
+                    session_id=session_id,
+                    user_id=user_id,
+                    system_prompt=system_prompt,
+                    metadata=metadata,
                 )
                 self._json(
                     handler,
@@ -262,8 +269,11 @@ class OpenAIAPIServer:
                 session_id = unquote(
                     path.removeprefix("/sessions/").removesuffix("/messages")
                 ).rstrip("/")
+                content = body.get("content")
+                if not isinstance(content, str) or not content:
+                    raise ValueError("content must be a non-empty string")
                 request = self.chat.submit_message(
-                    session_id, str(body["content"]), **self._generation_args(body)
+                    session_id, content, **self._generation_args(body)
                 )
                 self.metrics.submitted(request)
                 self._observe_in_background(request)
@@ -299,14 +309,21 @@ class OpenAIAPIServer:
     def _chat_completion(
         self, handler: BaseHTTPRequestHandler, body: Mapping[str, object]
     ) -> None:
+        self._validate_model(body)
         raw_messages = body.get("messages")
-        if not isinstance(raw_messages, Sequence) or isinstance(raw_messages, str):
+        if not isinstance(raw_messages, Sequence) or isinstance(
+            raw_messages, (str, bytes)
+        ):
             raise ValueError("messages must be a non-empty sequence")
         messages = self._messages(raw_messages)
         if not messages or messages[-1].role != "user":
             raise ValueError("The final chat message must have role=user")
+        generation_args = self._generation_args(body)
+        stream = self._streaming(body)
 
-        requested_session = body.get("session_id")
+        requested_session = self._optional_string(body, "session_id")
+        if requested_session == "":
+            raise ValueError("session_id must not be empty")
         ephemeral = requested_session is None
         session_id = str(requested_session or f"openai-{uuid.uuid4().hex}")
         if ephemeral:
@@ -323,47 +340,51 @@ class OpenAIAPIServer:
                     initial_messages=messages[:-1],
                 )
 
-        request = self.chat.submit_message(
-            session_id,
-            messages[-1].content,
-            **self._generation_args(body),
-        )
-        self.metrics.submitted(request)
+        request: Optional[GenerationRequest] = None
         try:
-            if bool(body.get("stream", False)):
+            request = self.chat.submit_message(
+                session_id,
+                messages[-1].content,
+                **generation_args,
+            )
+            self.metrics.submitted(request)
+            if stream:
                 self._stream_chat(handler, request)
             else:
                 self._complete_chat(handler, request)
         finally:
-            if ephemeral and request.status not in (
-                RequestStatus.WAITING,
-                RequestStatus.RUNNING,
-            ):
-                self.scheduler.sessions.delete(session_id)
+            if ephemeral:
+                session = self.scheduler.sessions.get(session_id)
+                if not session.busy:
+                    self.scheduler.sessions.delete(session_id)
 
     def _text_completion(
         self, handler: BaseHTTPRequestHandler, body: Mapping[str, object]
     ) -> None:
+        self._validate_model(body)
         prompt = body.get("prompt")
         if not isinstance(prompt, str):
             raise ValueError("prompt must be a string")
+        generation_args = self._generation_args(body)
+        stream = self._streaming(body)
         session_id = f"completion-{uuid.uuid4().hex}"
         self.scheduler.sessions.create(session_id=session_id)
-        input_tokens = [int(token) for token in self.chat.tokenizer.encode(prompt)]
-        request = self.scheduler.submit(
-            session_id, input_tokens, **self._generation_args(body)
-        )
-        self.metrics.submitted(request)
+        request: Optional[GenerationRequest] = None
         try:
-            if bool(body.get("stream", False)):
+            input_tokens = [
+                int(token) for token in self.chat.tokenizer.encode(prompt)
+            ]
+            request = self.scheduler.submit(
+                session_id, input_tokens, **generation_args
+            )
+            self.metrics.submitted(request)
+            if stream:
                 self._stream_text(handler, request)
             else:
                 events = list(self.scheduler.events(request.request_id, timeout=None))
                 for event in events:
                     self.metrics.observed(request, event)
-                text = self.chat.tokenizer.decode(
-                    request.generated_tokens, skip_special_tokens=True
-                )
+                text = request.streamed_text
                 self._json(
                     handler,
                     HTTPStatus.OK,
@@ -384,7 +405,8 @@ class OpenAIAPIServer:
                     },
                 )
         finally:
-            if request.status not in (RequestStatus.WAITING, RequestStatus.RUNNING):
+            session = self.scheduler.sessions.get(session_id)
+            if not session.busy:
                 self.scheduler.sessions.delete(session_id)
 
     def _complete_chat(
@@ -395,9 +417,7 @@ class OpenAIAPIServer:
             self.metrics.observed(request, event)
         if request.status is RequestStatus.FAILED:
             raise RuntimeError(request.error or "Model inference failed")
-        content = self.chat.tokenizer.decode(
-            request.generated_tokens, skip_special_tokens=True
-        )
+        content = request.streamed_text
         self._json(
             handler,
             HTTPStatus.OK,
@@ -499,9 +519,13 @@ class OpenAIAPIServer:
         for raw in raw_messages:
             if not isinstance(raw, Mapping):
                 raise ValueError("Each message must be an object")
-            messages.append(
-                ChatMessage(role=str(raw["role"]), content=str(raw["content"]))
-            )
+            role = raw.get("role")
+            content = raw.get("content")
+            if not isinstance(role, str):
+                raise ValueError("message role must be a string")
+            if not isinstance(content, str):
+                raise ValueError("message content must be a string")
+            messages.append(ChatMessage(role=role, content=content))
         return messages
 
     @staticmethod
@@ -513,18 +537,132 @@ class OpenAIAPIServer:
             raw_stop_tokens, (str, bytes)
         ):
             raise ValueError("stop_token_ids must be a sequence of integers")
+        stop_tokens = []
+        for token in raw_stop_tokens:
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise ValueError(
+                    "stop_token_ids must contain non-negative integers"
+                )
+            stop_tokens.append(token)
+
+        raw_stop = body.get("stop", ())
+        if raw_stop is None:
+            stop_strings: Tuple[str, ...] = ()
+        elif isinstance(raw_stop, str):
+            stop_strings = (raw_stop,)
+        elif isinstance(raw_stop, Sequence) and not isinstance(raw_stop, bytes):
+            if any(not isinstance(stop, str) for stop in raw_stop):
+                raise ValueError("stop must contain only strings")
+            stop_strings = tuple(raw_stop)
+        else:
+            raise ValueError("stop must be a string or a sequence of strings")
+        if any(not stop for stop in stop_strings):
+            raise ValueError("stop strings must not be empty")
+
+        max_tokens_key = (
+            "max_tokens" if "max_tokens" in body else "max_completion_tokens"
+        )
+        max_tokens = OpenAIAPIServer._integer(
+            body, max_tokens_key, 128, minimum=1
+        )
+        priority = OpenAIAPIServer._integer(body, "priority", 0)
+        top_k = OpenAIAPIServer._integer(body, "top_k", 1, minimum=0)
+        seed = OpenAIAPIServer._integer(body, "seed", 0, minimum=0)
+        if seed >= 2**64:
+            raise ValueError("seed must fit in an unsigned 64-bit integer")
         timeout = body.get("timeout_seconds")
+        if timeout is not None:
+            timeout = OpenAIAPIServer._number(
+                body, "timeout_seconds", 0.0, minimum=0.0, strict_minimum=True
+            )
+        truncate_prompt = body.get("truncate_prompt", False)
+        if not isinstance(truncate_prompt, bool):
+            raise ValueError("truncate_prompt must be a boolean")
         return {
-            "max_new_tokens": int(body.get("max_tokens", 128)),
-            "priority": int(body.get("priority", 0)),
-            "stop_token_ids": tuple(int(token) for token in raw_stop_tokens),
-            "timeout_seconds": float(timeout) if timeout is not None else None,
-            "top_k": int(body.get("top_k", 1)),
-            "top_p": float(body.get("top_p", 0.8)),
-            "temperature": float(body.get("temperature", 0.8)),
-            "repetition_penalty": float(body.get("repetition_penalty", 1.0)),
-            "seed": int(body.get("seed", 0)),
+            "max_new_tokens": max_tokens,
+            "priority": priority,
+            "stop_token_ids": tuple(stop_tokens),
+            "stop_strings": stop_strings,
+            "truncate_prompt": truncate_prompt,
+            "timeout_seconds": timeout,
+            "top_k": top_k,
+            "top_p": OpenAIAPIServer._number(
+                body, "top_p", 0.8, minimum=0.0, maximum=1.0,
+                strict_minimum=True
+            ),
+            "temperature": OpenAIAPIServer._number(
+                body, "temperature", 0.8, minimum=0.0, strict_minimum=True
+            ),
+            "repetition_penalty": OpenAIAPIServer._number(
+                body,
+                "repetition_penalty",
+                1.0,
+                minimum=0.0,
+                strict_minimum=True,
+            ),
+            "seed": seed,
         }
+
+    @staticmethod
+    def _integer(
+        body: Mapping[str, object],
+        name: str,
+        default: int,
+        minimum: Optional[int] = None,
+    ) -> int:
+        value = body.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+        if minimum is not None and value < minimum:
+            raise ValueError(f"{name} must be at least {minimum}")
+        return value
+
+    @staticmethod
+    def _number(
+        body: Mapping[str, object],
+        name: str,
+        default: float,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+        strict_minimum: bool = False,
+    ) -> float:
+        value = body.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a number")
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError(f"{name} must be finite")
+        if minimum is not None and (
+            result <= minimum if strict_minimum else result < minimum
+        ):
+            comparison = "greater than" if strict_minimum else "at least"
+            raise ValueError(f"{name} must be {comparison} {minimum}")
+        if maximum is not None and result > maximum:
+            raise ValueError(f"{name} must be at most {maximum}")
+        return result
+
+    @staticmethod
+    def _optional_string(
+        body: Mapping[str, object], name: str
+    ) -> Optional[str]:
+        value = body.get(name)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{name} must be a string")
+        return value
+
+    def _validate_model(self, body: Mapping[str, object]) -> None:
+        model = body.get("model")
+        if not isinstance(model, str) or not model:
+            raise ValueError("model must be a non-empty string")
+        if model != self.model_id:
+            raise ValueError(f"Unknown model: {model}")
+
+    @staticmethod
+    def _streaming(body: Mapping[str, object]) -> bool:
+        stream = body.get("stream", False)
+        if not isinstance(stream, bool):
+            raise ValueError("stream must be a boolean")
+        return stream
 
     @staticmethod
     def _usage(request: GenerationRequest) -> Dict[str, int]:

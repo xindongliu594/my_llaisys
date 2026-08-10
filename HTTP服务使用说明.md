@@ -123,3 +123,28 @@ curl http://127.0.0.1:8000/metrics
 调度器在每个 Token 步骤使用完整上下文重新推理。因此，这一版本强调接口和功能
 完整性，不代表高性能 Continuous Batching。后续若追求吞吐量，需要实现每请求独立的
 Paged KV Cache，并让一次 C++ Decode 同时接收多个 sequence。
+
+## 7. 上下文保护与停止条件
+
+服务会读取模型配置中的 `max_position_embeddings`。默认情况下，如果“输入 Token
+数 + `max_tokens`”超过模型上限，请求会返回 HTTP 400，而不是进入后端后越界。
+如明确接受丢弃最早的上下文，可传入：
+
+```json
+{
+  "truncate_prompt": true
+}
+```
+
+服务同时支持 Token ID 和文本停止条件。文本停止条件可以跨越多个 Token，命中的
+停止字符串不会出现在普通响应或 SSE 增量中：
+
+```json
+{
+  "stop_token_ids": [151643],
+  "stop": ["<END>", "用户："]
+}
+```
+
+生成参数执行严格类型和范围检查，包括模型名称、`max_tokens`、`top_k`、`top_p`、
+`temperature`、`repetition_penalty`、`seed`、`stream`、超时时间及消息字段。

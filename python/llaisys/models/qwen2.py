@@ -85,6 +85,10 @@ class Qwen2:
     def eos_token_id(self) -> int:
         return self._end_token
 
+    @property
+    def max_sequence_length(self) -> int:
+        return int(self._meta.maxseq)
+
     def _weight_handle(self, weights, name: str):
         if name == "model.embed_tokens.weight":
             return weights.in_embed
@@ -158,9 +162,17 @@ class Qwen2:
             raise ValueError("repetition_penalty must be positive")
         if max_new_tokens is None:
             max_new_tokens = 128
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
         output = [int(token) for token in inputs]
         if not output:
             raise ValueError("Qwen2 generation requires at least one input token")
+        if len(output) + max_new_tokens > self.max_sequence_length:
+            raise ValueError(
+                f"Input ({len(output)}) plus requested output "
+                f"({max_new_tokens}) exceeds max_sequence_length "
+                f"({self.max_sequence_length})"
+            )
 
         LIB_LLAISYS.llaisysQwen2ModelReset(self._model)
         prompt = (ctypes.c_int64 * len(output))(*output)

@@ -9,6 +9,7 @@ import llaisys
 
 class ServerModel:
     eos_token_id = 99
+    max_sequence_length = 3
 
     def generate(self, inputs, max_new_tokens=None, **_):
         assert max_new_tokens == 1
@@ -71,6 +72,68 @@ class HTTPServerTest(unittest.TestCase):
         )
         with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, response.headers, response.read()
+
+    def request_error(self, method, path, data):
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            self.request(method, path, data)
+        return raised.exception.code, json.loads(raised.exception.read())
+
+    def test_context_stop_strings_and_strict_validation(self):
+        status, _, body = self.request(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Stop"}],
+                "max_tokens": 2,
+                "stop": "A",
+            },
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertEqual(result["choices"][0]["message"]["content"], "")
+        self.assertEqual(result["choices"][0]["finish_reason"], "stop")
+
+        invalid_bodies = [
+            {
+                "model": "wrong-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 0,
+            },
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "temperature": "hot",
+            },
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": "false",
+            },
+        ]
+        for invalid in invalid_bodies:
+            with self.subTest(invalid=invalid):
+                code, error = self.request_error(
+                    "POST", "/v1/chat/completions", invalid
+                )
+                self.assertEqual(code, 400)
+                self.assertIn("message", error["error"])
+
+        code, error = self.request_error(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Too long"}],
+                "max_tokens": 3,
+            },
+        )
+        self.assertEqual(code, 400)
+        self.assertIn("max_sequence_length", error["error"]["message"])
 
     def test_health_models_and_chat_completion(self):
         status, _, body = self.request("GET", "/health")

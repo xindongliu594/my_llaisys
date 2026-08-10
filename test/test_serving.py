@@ -21,6 +21,18 @@ class FailingModel:
         raise RuntimeError("synthetic backend failure")
 
 
+class LimitedModel(FakeModel):
+    max_sequence_length = 4
+
+
+class SplitStopModel:
+    def generate(self, inputs, max_new_tokens=None, **_):
+        assert max_new_tokens == 1
+        context = list(inputs)
+        generated = (10, 11, 12)
+        return context + [generated[len(context) - 1]]
+
+
 class StepModel:
     eos_token_id = 99
 
@@ -67,6 +79,22 @@ class FakeTokenizer:
 
 
 class ServingTest(unittest.TestCase):
+    def test_context_limit_rejects_or_left_truncates(self):
+        model = LimitedModel()
+        scheduler = llaisys.RequestScheduler(model)
+        scheduler.sessions.create("limited", initial_tokens=[1, 2])
+
+        with self.assertRaisesRegex(ValueError, "Prompt has 3 tokens"):
+            scheduler.submit("limited", [3], max_new_tokens=2)
+
+        request = scheduler.submit(
+            "limited", [3], max_new_tokens=2, truncate_prompt=True
+        )
+        scheduler.run_until_idle(raise_on_error=True)
+
+        self.assertEqual(model.contexts, [[2, 3]])
+        self.assertEqual(request.context_length, 2)
+
     def test_priority_fifo_and_independent_sessions(self):
         model = FakeModel()
         scheduler = llaisys.RequestScheduler(model)
@@ -141,6 +169,24 @@ class ServingTest(unittest.TestCase):
 
 
 class RoundRobinServingTest(unittest.TestCase):
+    def test_stop_string_can_span_tokens_without_leaking_prefix(self):
+        pieces = {10: "answer<", 11: "END>", 12: "ignored"}
+        scheduler = llaisys.RoundRobinScheduler(
+            SplitStopModel(),
+            sequence_decoder=lambda tokens: "".join(pieces[token] for token in tokens),
+        )
+        scheduler.sessions.create("stop-text", initial_tokens=[1])
+        request = scheduler.submit(
+            "stop-text", [], max_new_tokens=3, stop_strings=["<END>"]
+        )
+
+        events = list(scheduler.run_until_idle_stream())
+
+        self.assertEqual([event.text for event in events], ["answer", None])
+        self.assertEqual(request.finish_reason, llaisys.FinishReason.STOP)
+        self.assertEqual(request.streamed_text, "answer")
+        self.assertEqual(request.generated_tokens, (10, 11))
+
     def test_priority_admission_then_round_robin_stream(self):
         model = StepModel()
         scheduler = llaisys.RoundRobinScheduler(model)
