@@ -6,6 +6,7 @@ import urllib.request
 
 import llaisys
 from llaisys.benchmark import run_benchmark
+from llaisys.stress_benchmark import run_stress_benchmark
 
 
 class ServerModel:
@@ -21,11 +22,13 @@ class ServerModel:
 
 class ServerBatchedModel(ServerModel):
     supports_sequence_batching = True
+    max_sequence_length = 16
 
-    def __init__(self):
+    def __init__(self, decode_delay=0.0):
         self.sequences = set()
         self.logprob_counts = {}
         self.last_outputs = {}
+        self.decode_delay = decode_delay
 
     @staticmethod
     def estimate_kv_cache_bytes(capacity):
@@ -58,8 +61,13 @@ class ServerBatchedModel(ServerModel):
         return 65
 
     def decode_batch(self, sequence_ids, token_ids, sampling_configs):
-        del token_ids, sampling_configs
-        outputs = [self.eos_token_id] * len(sequence_ids)
+        del sampling_configs
+        time.sleep(self.decode_delay)
+        outputs = (
+            [int(token) + 1 for token in token_ids]
+            if self.decode_delay
+            else [self.eos_token_id] * len(sequence_ids)
+        )
         self.last_outputs.update(zip(sequence_ids, outputs))
         return outputs
 
@@ -153,6 +161,20 @@ class HTTPServerTest(unittest.TestCase):
         self.assertIn("llaisys_queue_seconds_p95", metrics)
         self.assertIn("llaisys_prefill_seconds_p95", metrics)
         self.assertIn("llaisys_decode_seconds_p95", metrics)
+
+        stress = run_stress_benchmark(
+            endpoint=self.base_url,
+            model="test-model",
+            requests=4,
+            concurrency=2,
+            prompt_words=(1, 2),
+            output_lengths=(1, 2),
+            cancellation_ratio=0.0,
+            timeout=5,
+        )
+        self.assertEqual(stress["completed"], 4)
+        self.assertEqual(stress["failed"], 0)
+        self.assertFalse(stress["resource_leak_detected"])
 
     def test_context_stop_strings_and_strict_validation(self):
         status, _, body = self.request(
@@ -345,6 +367,33 @@ class HTTPServerTest(unittest.TestCase):
         self.assertEqual(content[0]["token_id"], 65)
         self.assertEqual(len(content[0]["top_logprobs"]), 2)
         self.assertEqual(model.sequences, set())
+
+        slow_model = ServerBatchedModel(decode_delay=0.02)
+        slow_scheduler = llaisys.OrcaScheduler(slow_model)
+        slow_chat = llaisys.ChatService(slow_scheduler, ServerTokenizer())
+        slow_server = llaisys.OpenAIAPIServer(
+            slow_chat, model_id="stress-model", host="127.0.0.1", port=0
+        )
+        slow_server.start()
+        slow_host, slow_port = slow_server.address
+        try:
+            stress = run_stress_benchmark(
+                endpoint=f"http://{slow_host}:{slow_port}",
+                model="stress-model",
+                requests=4,
+                concurrency=2,
+                prompt_words=(1, 2),
+                output_lengths=(4,),
+                cancellation_ratio=1.0,
+                cancel_after_tokens=1,
+                timeout=5,
+            )
+        finally:
+            slow_server.stop()
+        self.assertEqual(stress["cancelled"], 4)
+        self.assertEqual(stress["failed"], 0)
+        self.assertFalse(stress["resource_leak_detected"])
+        self.assertEqual(slow_model.sequences, set())
 
     def test_z_readiness_and_draining_reject_new_work(self):
         status, _, body = self.request("GET", "/ready")
