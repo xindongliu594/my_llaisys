@@ -13,6 +13,7 @@ import math
 import threading
 import time
 import uuid
+import weakref
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -254,7 +255,7 @@ class OpenAIAPIServer:
             )
 
     def _handler_type(self):
-        owner = self
+        owner_ref = weakref.ref(self)
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -263,13 +264,19 @@ class OpenAIAPIServer:
                 return
 
             def do_GET(self):
-                owner._handle_get(self)
+                owner = owner_ref()
+                if owner is not None:
+                    owner._handle_get(self)
 
             def do_POST(self):
-                owner._handle_post(self)
+                owner = owner_ref()
+                if owner is not None:
+                    owner._handle_post(self)
 
             def do_DELETE(self):
-                owner._handle_delete(self)
+                owner = owner_ref()
+                if owner is not None:
+                    owner._handle_delete(self)
 
         return Handler
 
