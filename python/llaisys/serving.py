@@ -177,12 +177,14 @@ class GenerationRequest:
     session_id: str
     input_tokens: Tuple[int, ...]
     max_new_tokens: int
+    min_new_tokens: int = 0
     priority: int = 0
     top_k: int = 1
     top_p: float = 0.8
     temperature: float = 0.8
     repetition_penalty: float = 1.0
     seed: int = 0
+    ignore_eos: bool = False
     stop_token_ids: Tuple[int, ...] = ()
     stop_strings: Tuple[str, ...] = ()
     truncate_prompt: bool = False
@@ -531,6 +533,7 @@ class RequestScheduler:
         session_id: str,
         input_tokens: Sequence[int],
         max_new_tokens: int = 128,
+        min_new_tokens: int = 0,
         priority: int = 0,
         request_id: Optional[str] = None,
         stop_token_ids: Sequence[int] = (),
@@ -545,11 +548,16 @@ class RequestScheduler:
         temperature: float = 0.8,
         repetition_penalty: float = 1.0,
         seed: int = 0,
+        ignore_eos: bool = False,
     ) -> GenerationRequest:
         if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
             raise ValueError("max_new_tokens must be an integer")
         if max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
+        if isinstance(min_new_tokens, bool) or not isinstance(min_new_tokens, int):
+            raise ValueError("min_new_tokens must be an integer")
+        if not 0 <= min_new_tokens <= max_new_tokens:
+            raise ValueError("min_new_tokens must be between 0 and max_new_tokens")
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise ValueError("priority must be an integer")
         for timeout_name, timeout_value in (
@@ -597,6 +605,8 @@ class RequestScheduler:
             raise ValueError("seed must be an integer")
         if not 0 <= seed < 2**64:
             raise ValueError("seed must fit in an unsigned 64-bit integer")
+        if not isinstance(ignore_eos, bool):
+            raise ValueError("ignore_eos must be a boolean")
         if any(
             isinstance(token, bool) or not isinstance(token, int) or token < 0
             for token in input_tokens
@@ -632,12 +642,14 @@ class RequestScheduler:
             session_id=session_id,
             input_tokens=tokens,
             max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
             priority=priority,
             top_k=top_k,
             top_p=float(top_p),
             temperature=float(temperature),
             repetition_penalty=float(repetition_penalty),
             seed=seed,
+            ignore_eos=ignore_eos,
             stop_token_ids=stop_tokens,
             stop_strings=normalized_stops,
             truncate_prompt=truncate_prompt,
@@ -793,6 +805,7 @@ class RoundRobinScheduler(RequestScheduler):
         session_id: str,
         input_tokens: Sequence[int],
         max_new_tokens: int = 128,
+        min_new_tokens: int = 0,
         priority: int = 0,
         request_id: Optional[str] = None,
         stop_token_ids: Sequence[int] = (),
@@ -807,6 +820,7 @@ class RoundRobinScheduler(RequestScheduler):
         temperature: float = 0.8,
         repetition_penalty: float = 1.0,
         seed: int = 0,
+        ignore_eos: bool = False,
     ) -> GenerationRequest:
         request_id = request_id or uuid.uuid4().hex
         with self._events_lock:
@@ -818,6 +832,7 @@ class RoundRobinScheduler(RequestScheduler):
                 session_id=session_id,
                 input_tokens=input_tokens,
                 max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
                 priority=priority,
                 request_id=request_id,
                 stop_token_ids=stop_token_ids,
@@ -832,6 +847,7 @@ class RoundRobinScheduler(RequestScheduler):
                 temperature=temperature,
                 repetition_penalty=repetition_penalty,
                 seed=seed,
+                ignore_eos=ignore_eos,
             )
             self._reserve_request_resources(request)
         except Exception:
@@ -1158,10 +1174,18 @@ class RoundRobinScheduler(RequestScheduler):
     def _finish_reason(
         self, request: GenerationRequest, token_id: int
     ) -> Optional[FinishReason]:
-        if self._eos_token_id is not None and token_id == self._eos_token_id:
-            return FinishReason.EOS
-        if token_id in request.stop_token_ids:
-            return FinishReason.STOP
+        minimum_reached = (
+            len(request.generated_token_ids) >= request.min_new_tokens
+        )
+        if minimum_reached:
+            if (
+                not request.ignore_eos
+                and self._eos_token_id is not None
+                and token_id == self._eos_token_id
+            ):
+                return FinishReason.EOS
+            if token_id in request.stop_token_ids:
+                return FinishReason.STOP
         if len(request.generated_token_ids) >= request.max_new_tokens:
             return FinishReason.LENGTH
         return None
@@ -1576,6 +1600,7 @@ class ChatService:
         session_id: str,
         content: str,
         max_new_tokens: int = 128,
+        min_new_tokens: int = 0,
         priority: int = 0,
         request_id: Optional[str] = None,
         stop_token_ids: Sequence[int] = (),
@@ -1590,6 +1615,7 @@ class ChatService:
         temperature: float = 0.8,
         repetition_penalty: float = 1.0,
         seed: int = 0,
+        ignore_eos: bool = False,
     ) -> GenerationRequest:
         previous = self.scheduler.sessions.get(session_id)
         messages = previous.messages + [ChatMessage("user", str(content))]
@@ -1609,6 +1635,7 @@ class ChatService:
                 session_id=session_id,
                 input_tokens=input_tokens,
                 max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
                 priority=priority,
                 request_id=request_id,
                 stop_token_ids=stop_token_ids,
@@ -1623,6 +1650,7 @@ class ChatService:
                 temperature=temperature,
                 repetition_penalty=repetition_penalty,
                 seed=seed,
+                ignore_eos=ignore_eos,
             )
         except Exception:
             self.scheduler.sessions.replace_messages(

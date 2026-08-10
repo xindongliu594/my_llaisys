@@ -227,6 +227,36 @@ class HTTPServerTest(unittest.TestCase):
         self.assertIn("chat.completion.chunk", text)
         self.assertIn("data: [DONE]", text)
 
+    def test_tokenize_and_detokenize(self):
+        status, _, body = self.request(
+            "POST",
+            "/v1/tokenize",
+            {"model": "test-model", "text": "Hello"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {
+            "object": "tokens", "tokens": [1], "count": 1
+        })
+
+        status, _, body = self.request(
+            "POST",
+            "/v1/tokenize",
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["count"], 1)
+
+        status, _, body = self.request(
+            "POST",
+            "/v1/detokenize",
+            {"model": "test-model", "tokens": [65, 99]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["text"], "A")
+
     def test_z_readiness_and_draining_reject_new_work(self):
         status, _, body = self.request("GET", "/ready")
         self.assertEqual(status, 200)

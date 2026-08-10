@@ -415,6 +415,12 @@ class OpenAIAPIServer:
             if path == "/v1/completions":
                 self._text_completion(handler, body)
                 return
+            if path == "/v1/tokenize":
+                self._tokenize(handler, body)
+                return
+            if path == "/v1/detokenize":
+                self._detokenize(handler, body)
+                return
             if path == "/sessions/import":
                 raw_session = body.get("session", body)
                 if not isinstance(raw_session, Mapping):
@@ -594,6 +600,65 @@ class OpenAIAPIServer:
             if not session.busy:
                 self.scheduler.sessions.delete(session_id)
 
+    def _tokenize(
+        self, handler: BaseHTTPRequestHandler, body: Mapping[str, object]
+    ) -> None:
+        self._validate_model(body)
+        if "messages" in body:
+            raw_messages = body["messages"]
+            if not isinstance(raw_messages, Sequence) or isinstance(
+                raw_messages, (str, bytes)
+            ):
+                raise ValueError("messages must be a sequence")
+            messages = self._messages(raw_messages)
+            add_generation_prompt = body.get("add_generation_prompt", True)
+            if not isinstance(add_generation_prompt, bool):
+                raise ValueError("add_generation_prompt must be a boolean")
+            rendered = self.chat.tokenizer.apply_chat_template(
+                [message.as_dict() for message in messages],
+                add_generation_prompt=add_generation_prompt,
+                tokenize=False,
+            )
+            if not isinstance(rendered, str):
+                raise TypeError("Chat tokenizer must return text")
+            text = rendered
+        else:
+            text = body.get("text", body.get("prompt"))
+            if not isinstance(text, str):
+                raise ValueError("text must be a string")
+        tokens = [int(token) for token in self.chat.tokenizer.encode(text)]
+        self._json(
+            handler,
+            HTTPStatus.OK,
+            {"object": "tokens", "tokens": tokens, "count": len(tokens)},
+        )
+
+    def _detokenize(
+        self, handler: BaseHTTPRequestHandler, body: Mapping[str, object]
+    ) -> None:
+        self._validate_model(body)
+        raw_tokens = body.get("tokens")
+        if not isinstance(raw_tokens, Sequence) or isinstance(
+            raw_tokens, (str, bytes)
+        ):
+            raise ValueError("tokens must be a sequence of integers")
+        tokens = []
+        for token in raw_tokens:
+            if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                raise ValueError("tokens must contain non-negative integers")
+            tokens.append(token)
+        skip_special_tokens = body.get("skip_special_tokens", True)
+        if not isinstance(skip_special_tokens, bool):
+            raise ValueError("skip_special_tokens must be a boolean")
+        text = self.chat.tokenizer.decode(
+            tokens, skip_special_tokens=skip_special_tokens
+        )
+        self._json(
+            handler,
+            HTTPStatus.OK,
+            {"object": "text", "text": text, "count": len(tokens)},
+        )
+
     def _complete_chat(
         self, handler: BaseHTTPRequestHandler, request: GenerationRequest
     ) -> None:
@@ -761,6 +826,11 @@ class OpenAIAPIServer:
         max_tokens = OpenAIAPIServer._integer(
             body, max_tokens_key, 128, minimum=1
         )
+        min_tokens = OpenAIAPIServer._integer(
+            body, "min_tokens", 0, minimum=0
+        )
+        if min_tokens > max_tokens:
+            raise ValueError("min_tokens must not exceed max_tokens")
         priority = OpenAIAPIServer._integer(body, "priority", 0)
         top_k = OpenAIAPIServer._integer(body, "top_k", 1, minimum=0)
         seed = OpenAIAPIServer._integer(body, "seed", 0, minimum=0)
@@ -786,12 +856,17 @@ class OpenAIAPIServer:
         truncate_prompt = body.get("truncate_prompt", False)
         if not isinstance(truncate_prompt, bool):
             raise ValueError("truncate_prompt must be a boolean")
+        ignore_eos = body.get("ignore_eos", False)
+        if not isinstance(ignore_eos, bool):
+            raise ValueError("ignore_eos must be a boolean")
         return {
             "max_new_tokens": max_tokens,
+            "min_new_tokens": min_tokens,
             "priority": priority,
             "stop_token_ids": tuple(stop_tokens),
             "stop_strings": stop_strings,
             "truncate_prompt": truncate_prompt,
+            "ignore_eos": ignore_eos,
             "timeout_seconds": timeout,
             **phase_timeouts,
             "top_k": top_k,

@@ -314,6 +314,24 @@ class RoundRobinServingTest(unittest.TestCase):
         self.assertEqual(stop_request.finish_reason, llaisys.FinishReason.STOP)
         self.assertTrue(all(event.finished for event in events))
 
+    def test_min_tokens_and_ignore_eos(self):
+        scheduler = llaisys.RoundRobinScheduler(StepModel())
+        scheduler.sessions.create("minimum", initial_tokens=[3])
+        scheduler.sessions.create("ignored", initial_tokens=[3])
+        minimum = scheduler.submit(
+            "minimum", [], max_new_tokens=4, min_new_tokens=2
+        )
+        ignored = scheduler.submit(
+            "ignored", [], max_new_tokens=3, ignore_eos=True
+        )
+
+        list(scheduler.run_until_idle_stream())
+
+        self.assertEqual(minimum.finish_reason, llaisys.FinishReason.EOS)
+        self.assertEqual(len(minimum.generated_tokens), 2)
+        self.assertEqual(ignored.finish_reason, llaisys.FinishReason.LENGTH)
+        self.assertEqual(len(ignored.generated_tokens), 3)
+
     def test_running_cancel_commits_streamed_prefix(self):
         scheduler = llaisys.RoundRobinScheduler(StepModel())
         scheduler.sessions.create("conversation", initial_tokens=[1])
