@@ -1,5 +1,6 @@
 import argparse
 import gc
+import math
 
 from transformers import AutoTokenizer
 
@@ -47,6 +48,7 @@ def compare_orca_with_single_sequence(model_path, device, max_new_tokens):
                 [],
                 max_new_tokens=max_new_tokens,
                 top_k=1,
+                logprobs=3,
             )
         )
     list(scheduler.run_until_idle_stream())
@@ -56,7 +58,20 @@ def compare_orca_with_single_sequence(model_path, device, max_new_tokens):
         raise AssertionError(
             f"Orca output mismatch\nexpected={expected}\nactual={actual}"
         )
+    for request in requests:
+        if len(request.generated_logprobs) != len(request.generated_tokens):
+            raise AssertionError("Every generated token must have logprobs")
+        for token, token_logprobs in zip(
+            request.generated_tokens, request.generated_logprobs
+        ):
+            if int(token_logprobs["token_id"]) != token:
+                raise AssertionError("Logprob token does not match generation")
+            if not math.isfinite(float(token_logprobs["logprob"])):
+                raise AssertionError("Selected-token logprob must be finite")
+            if len(token_logprobs["top_logprobs"]) != 3:
+                raise AssertionError("Expected three top logprobs")
     print("Single-sequence and Orca token outputs match.")
+    print("Backend token logprobs are finite and aligned.")
     print("Decode batch sizes:", list(scheduler.decode_batch_sizes))
     print("Generated text:")
     for tokens in actual:
