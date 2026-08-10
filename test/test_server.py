@@ -105,6 +105,9 @@ class HTTPServerTest(unittest.TestCase):
         self.assertIn("llaisys_generated_tokens_per_second", metrics)
         self.assertIn("llaisys_request_queue_pending", metrics)
         self.assertIn("llaisys_request_active_sequences", metrics)
+        self.assertIn("llaisys_queue_seconds_p95", metrics)
+        self.assertIn("llaisys_prefill_seconds_p95", metrics)
+        self.assertIn("llaisys_decode_seconds_p95", metrics)
 
     def test_context_stop_strings_and_strict_validation(self):
         status, _, body = self.request(
@@ -177,15 +180,22 @@ class HTTPServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["data"][0]["id"], "test-model")
 
-        status, _, body = self.request(
-            "POST",
-            "/v1/chat/completions",
-            {
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "max_tokens": 2,
-            },
+        with self.assertLogs("llaisys.requests", level="INFO") as logs:
+            status, _, body = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 2,
+                },
+            )
+        structured = json.loads(
+            logs.output[-1].split("INFO:llaisys.requests:", 1)[-1]
         )
+        self.assertEqual(structured["event"], "request_finished")
+        self.assertEqual(structured["status"], "finished")
+        self.assertIn("ttft_ms", structured)
         self.assertEqual(status, 200)
         result = json.loads(body)
         self.assertEqual(result["choices"][0]["message"]["content"], "A")

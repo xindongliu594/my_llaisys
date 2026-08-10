@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import threading
 import time
@@ -33,6 +34,9 @@ from .serving import (
     ServiceUnavailableError,
     TokenEvent,
 )
+
+
+LOGGER = logging.getLogger("llaisys.requests")
 
 
 class ServingMetrics:
@@ -60,6 +64,9 @@ class ServingMetrics:
         self._ttft_samples: Deque[float] = deque(maxlen=10000)
         self._duration_samples: Deque[float] = deque(maxlen=10000)
         self._token_rate_samples: Deque[float] = deque(maxlen=10000)
+        self._queue_samples: Deque[float] = deque(maxlen=10000)
+        self._prefill_samples: Deque[float] = deque(maxlen=10000)
+        self._decode_samples: Deque[float] = deque(maxlen=10000)
         self._resource_provider = resource_provider
 
     def submitted(self, request: GenerationRequest) -> None:
@@ -101,6 +108,66 @@ class ServingMetrics:
                 self.requests_failed += 1
             else:
                 self.requests_cancelled += 1
+            queue_seconds = (
+                request.started_at - request.created_at
+                if request.started_at is not None
+                else None
+            )
+            prefill_seconds = (
+                request.prefill_finished_at - request.prefill_started_at
+                if request.prefill_finished_at is not None
+                and request.prefill_started_at is not None
+                else None
+            )
+            decode_seconds = (
+                request.finished_at - request.decode_started_at
+                if request.finished_at is not None
+                and request.decode_started_at is not None
+                else None
+            )
+            for value, samples in (
+                (queue_seconds, self._queue_samples),
+                (prefill_seconds, self._prefill_samples),
+                (decode_seconds, self._decode_samples),
+            ):
+                if value is not None:
+                    samples.append(max(0.0, value))
+            LOGGER.info(
+                json.dumps(
+                    {
+                        "event": "request_finished",
+                        "request_id": request.request_id,
+                        "session_id": request.session_id,
+                        "status": request.status.value,
+                        "finish_reason": (
+                            request.finish_reason.value
+                            if request.finish_reason is not None
+                            else None
+                        ),
+                        "timeout_phase": request.timeout_phase,
+                        "prompt_tokens": (
+                            request.context_length or len(request.input_tokens)
+                        ),
+                        "output_tokens": len(request.generated_tokens),
+                        "queue_ms": self._milliseconds(queue_seconds),
+                        "prefill_ms": self._milliseconds(prefill_seconds),
+                        "decode_ms": self._milliseconds(decode_seconds),
+                        "ttft_ms": self._milliseconds(
+                            request.first_token_at - request.created_at
+                            if request.first_token_at is not None
+                            else None
+                        ),
+                        "total_ms": self._milliseconds(
+                            request.finished_at - request.created_at
+                            if request.finished_at is not None
+                            else None
+                        ),
+                        "error": request.error,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
 
     def snapshot(self) -> Dict[str, object]:
         with self._lock:
@@ -138,6 +205,9 @@ class ServingMetrics:
                 ("ttft_seconds", self._ttft_samples),
                 ("request_duration_seconds", self._duration_samples),
                 ("request_token_rate", self._token_rate_samples),
+                ("queue_seconds", self._queue_samples),
+                ("prefill_seconds", self._prefill_samples),
+                ("decode_seconds", self._decode_samples),
             ):
                 for label, quantile in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
                     snapshot[f"{name}_{label}"] = self._percentile(
@@ -146,6 +216,10 @@ class ServingMetrics:
             if self._resource_provider is not None:
                 snapshot.update(self._resource_provider())
             return snapshot
+
+    @staticmethod
+    def _milliseconds(value: Optional[float]) -> Optional[float]:
+        return None if value is None else value * 1000.0
 
     @staticmethod
     def _percentile(samples: Sequence[float], quantile: float) -> float:
@@ -1133,11 +1207,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--kv-cache-high-watermark", type=float, default=0.9
     )
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+    )
     args = parser.parse_args(argv)
     if args.max_kv_cache_mib < 0:
         parser.error("--max-kv-cache-mib must be non-negative")
     if not 0.0 < args.kv_cache_high_watermark <= 1.0:
         parser.error("--kv-cache-high-watermark must be in (0, 1]")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 
     # Imported lazily so importing llaisys.server does not require transformers.
     from transformers import AutoTokenizer

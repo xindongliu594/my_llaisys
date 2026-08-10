@@ -1315,6 +1315,8 @@ class OrcaScheduler(RoundRobinScheduler):
         self.model: SequenceBatchModel = model
         self.max_prefill_per_iteration = max_prefill_per_iteration
         self.decode_batch_sizes: Deque[int] = deque(maxlen=10000)
+        self.prefill_batch_sizes: Deque[int] = deque(maxlen=10000)
+        self.scheduler_iterations_total = 0
         self.kv_cache_budget = KVCacheBudget(
             max_bytes=max_kv_cache_bytes,
             high_watermark=kv_cache_high_watermark,
@@ -1344,6 +1346,37 @@ class OrcaScheduler(RoundRobinScheduler):
     def resource_snapshot(self) -> Dict[str, int | float]:
         snapshot = super().resource_snapshot()
         snapshot.update(self.kv_cache_budget.snapshot())
+        snapshot.update(
+            {
+                "orca_scheduler_iterations_total": self.scheduler_iterations_total,
+                "orca_prefill_batch_size_current": (
+                    self.prefill_batch_sizes[-1]
+                    if self.prefill_batch_sizes
+                    else 0
+                ),
+                "orca_prefill_batch_size_max": max(
+                    self.prefill_batch_sizes, default=0
+                ),
+                "orca_prefill_batch_size_mean": (
+                    sum(self.prefill_batch_sizes) / len(self.prefill_batch_sizes)
+                    if self.prefill_batch_sizes
+                    else 0.0
+                ),
+                "orca_decode_batch_size_current": (
+                    self.decode_batch_sizes[-1]
+                    if self.decode_batch_sizes
+                    else 0
+                ),
+                "orca_decode_batch_size_max": max(
+                    self.decode_batch_sizes, default=0
+                ),
+                "orca_decode_batch_size_mean": (
+                    sum(self.decode_batch_sizes) / len(self.decode_batch_sizes)
+                    if self.decode_batch_sizes
+                    else 0.0
+                ),
+            }
+        )
         model_snapshot = getattr(self.model, "kv_cache_snapshot", None)
         if model_snapshot is not None:
             snapshot.update(model_snapshot())
@@ -1394,6 +1427,7 @@ class OrcaScheduler(RoundRobinScheduler):
             self._active.clear()
             if not active_ids:
                 return events
+            self.scheduler_iterations_total += 1
 
             survivors: List[str] = []
             decode_requests: List[GenerationRequest] = []
@@ -1450,6 +1484,9 @@ class OrcaScheduler(RoundRobinScheduler):
                 events.append(event)
                 if request.status is RequestStatus.RUNNING:
                     survivors.append(request.request_id)
+
+            if prefills:
+                self.prefill_batch_sizes.append(prefills)
 
             if decode_requests:
                 ready_decode_requests = []
