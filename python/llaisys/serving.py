@@ -60,6 +60,14 @@ class SequenceBatchModel(GenerationModel, Protocol):
         sampling_configs: Sequence[Mapping[str, object]],
     ) -> Sequence[int]: ...
 
+    def configure_sequence_logprobs(
+        self, sequence_id: str, top_n: int
+    ) -> None: ...
+
+    def get_sequence_logprobs(
+        self, sequence_id: str, top_n: int
+    ) -> Mapping[str, object]: ...
+
 
 class ChatTokenizer(Protocol):
     def apply_chat_template(
@@ -185,6 +193,7 @@ class GenerationRequest:
     repetition_penalty: float = 1.0
     seed: int = 0
     ignore_eos: bool = False
+    logprobs: int = 0
     stop_token_ids: Tuple[int, ...] = ()
     stop_strings: Tuple[str, ...] = ()
     truncate_prompt: bool = False
@@ -200,6 +209,7 @@ class GenerationRequest:
     context_length: Optional[int] = None
     context_tokens: Optional[Tuple[int, ...]] = None
     generated_token_ids: List[int] = field(default_factory=list)
+    generated_logprobs: List[Mapping[str, object]] = field(default_factory=list)
     streamed_text: str = ""
     output_tokens: Optional[Tuple[int, ...]] = None
     error: Optional[str] = None
@@ -256,6 +266,7 @@ class TokenEvent:
     finished: bool = False
     finish_reason: Optional[FinishReason] = None
     error: Optional[str] = None
+    logprobs: Optional[Mapping[str, object]] = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -507,6 +518,7 @@ class RequestScheduler:
     """
 
     supports_continuous_batching = False
+    supports_logprobs = False
 
     def __init__(
         self,
@@ -549,6 +561,7 @@ class RequestScheduler:
         repetition_penalty: float = 1.0,
         seed: int = 0,
         ignore_eos: bool = False,
+        logprobs: int = 0,
     ) -> GenerationRequest:
         if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
             raise ValueError("max_new_tokens must be an integer")
@@ -607,6 +620,12 @@ class RequestScheduler:
             raise ValueError("seed must fit in an unsigned 64-bit integer")
         if not isinstance(ignore_eos, bool):
             raise ValueError("ignore_eos must be a boolean")
+        if isinstance(logprobs, bool) or not isinstance(logprobs, int):
+            raise ValueError("logprobs must be an integer")
+        if not 0 <= logprobs <= 20:
+            raise ValueError("logprobs must be between 0 and 20")
+        if logprobs and not self.supports_logprobs:
+            raise ValueError("This scheduler does not support logprobs")
         if any(
             isinstance(token, bool) or not isinstance(token, int) or token < 0
             for token in input_tokens
@@ -650,6 +669,7 @@ class RequestScheduler:
             repetition_penalty=float(repetition_penalty),
             seed=seed,
             ignore_eos=ignore_eos,
+            logprobs=logprobs,
             stop_token_ids=stop_tokens,
             stop_strings=normalized_stops,
             truncate_prompt=truncate_prompt,
@@ -821,6 +841,7 @@ class RoundRobinScheduler(RequestScheduler):
         repetition_penalty: float = 1.0,
         seed: int = 0,
         ignore_eos: bool = False,
+        logprobs: int = 0,
     ) -> GenerationRequest:
         request_id = request_id or uuid.uuid4().hex
         with self._events_lock:
@@ -848,6 +869,7 @@ class RoundRobinScheduler(RequestScheduler):
                 repetition_penalty=repetition_penalty,
                 seed=seed,
                 ignore_eos=ignore_eos,
+                logprobs=logprobs,
             )
             self._reserve_request_resources(request)
         except Exception:
@@ -1196,6 +1218,7 @@ class RoundRobinScheduler(RequestScheduler):
         reason: FinishReason,
         token_id: Optional[int] = None,
         text: Optional[str] = None,
+        logprobs: Optional[Mapping[str, object]] = None,
     ) -> TokenEvent:
         request.status = RequestStatus.FINISHED
         request.phase = RequestPhase.FINISHED
@@ -1212,6 +1235,7 @@ class RoundRobinScheduler(RequestScheduler):
             session_id=request.session_id,
             token_id=token_id,
             text=text,
+            logprobs=logprobs,
             finished=True,
             finish_reason=reason,
         )
@@ -1283,6 +1307,7 @@ class OrcaScheduler(RoundRobinScheduler):
     """
 
     supports_continuous_batching = True
+    supports_logprobs = True
 
     def __init__(
         self,
@@ -1395,6 +1420,14 @@ class OrcaScheduler(RoundRobinScheduler):
     def _accept_generated_token(
         self, request: GenerationRequest, token_id: int
     ) -> TokenEvent:
+        token_logprobs = None
+        if request.logprobs:
+            token_logprobs = self.model.get_sequence_logprobs(
+                request.request_id, request.logprobs
+            )
+            if int(token_logprobs["token_id"]) != int(token_id):
+                raise RuntimeError("Backend logprob token does not match output")
+            request.generated_logprobs.append(token_logprobs)
         request.generated_token_ids.append(int(token_id))
         if request.first_token_at is None:
             request.first_token_at = time.time()
@@ -1406,13 +1439,18 @@ class OrcaScheduler(RoundRobinScheduler):
             reason = FinishReason.STOP
         if reason is not None:
             return self._finalize_success(
-                request, reason, token_id=int(token_id), text=text
+                request,
+                reason,
+                token_id=int(token_id),
+                text=text,
+                logprobs=token_logprobs,
             )
         event = TokenEvent(
             request_id=request.request_id,
             session_id=request.session_id,
             token_id=int(token_id),
             text=text,
+            logprobs=token_logprobs,
         )
         self._publish(event)
         return event
@@ -1465,6 +1503,10 @@ class OrcaScheduler(RoundRobinScheduler):
                         request.request_id,
                         len(context) + request.max_new_tokens,
                     )
+                    if request.logprobs:
+                        self.model.configure_sequence_logprobs(
+                            request.request_id, request.logprobs
+                        )
                     token_id = self.model.prefill_sequence(
                         request.request_id,
                         context,
@@ -1563,10 +1605,15 @@ class OrcaScheduler(RoundRobinScheduler):
         reason: FinishReason,
         token_id: Optional[int] = None,
         text: Optional[str] = None,
+        logprobs: Optional[Mapping[str, object]] = None,
     ) -> TokenEvent:
         try:
             return super()._finalize_success(
-                request, reason, token_id=token_id, text=text
+                request,
+                reason,
+                token_id=token_id,
+                text=text,
+                logprobs=logprobs,
             )
         finally:
             self._destroy_model_sequence(request)
@@ -1653,6 +1700,7 @@ class ChatService:
         repetition_penalty: float = 1.0,
         seed: int = 0,
         ignore_eos: bool = False,
+        logprobs: int = 0,
     ) -> GenerationRequest:
         previous = self.scheduler.sessions.get(session_id)
         messages = previous.messages + [ChatMessage("user", str(content))]
@@ -1688,6 +1736,7 @@ class ChatService:
                 repetition_penalty=repetition_penalty,
                 seed=seed,
                 ignore_eos=ignore_eos,
+                logprobs=logprobs,
             )
         except Exception:
             self.scheduler.sessions.replace_messages(

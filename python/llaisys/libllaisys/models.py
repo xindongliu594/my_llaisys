@@ -106,6 +106,24 @@ def load_models(lib):
     ]
     lib.llaisysQwen2SequenceReset.restype = ctypes.c_int
 
+    lib.llaisysQwen2SequenceConfigureLogprobs.argtypes = [
+        LlaisysQwen2Model,
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+    ]
+    lib.llaisysQwen2SequenceConfigureLogprobs.restype = ctypes.c_int
+
+    lib.llaisysQwen2SequenceGetLogprobs.argtypes = [
+        LlaisysQwen2Model,
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t,
+    ]
+    lib.llaisysQwen2SequenceGetLogprobs.restype = ctypes.c_size_t
+
     lib.llaisysQwen2SequenceInfer.argtypes = [
         LlaisysQwen2Model,
         ctypes.c_uint64,

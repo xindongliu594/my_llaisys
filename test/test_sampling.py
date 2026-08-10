@@ -124,6 +124,48 @@ class SamplingBackendTest(unittest.TestCase):
         LIB_LLAISYS.llaisysQwen2SequenceDestroy(self.model, 101)
         LIB_LLAISYS.llaisysQwen2SequenceDestroy(self.model, 202)
 
+    def test_sequence_top_logprobs(self):
+        sequence_id = 303
+        self.assertTrue(
+            LIB_LLAISYS.llaisysQwen2SequenceCreate(
+                self.model, sequence_id, 4
+            )
+        )
+        self.assertTrue(
+            LIB_LLAISYS.llaisysQwen2SequenceConfigureLogprobs(
+                self.model, sequence_id, 3
+            )
+        )
+        prompt = ctypes.c_int64(0)
+        selected = int(
+            LIB_LLAISYS.llaisysQwen2SequenceInfer(
+                self.model, sequence_id, ctypes.byref(prompt), 1
+            )
+        )
+        selected_token = ctypes.c_int64()
+        selected_logprob = ctypes.c_float()
+        token_ids = (ctypes.c_int64 * 3)()
+        logprobs = (ctypes.c_float * 3)()
+        count = int(
+            LIB_LLAISYS.llaisysQwen2SequenceGetLogprobs(
+                self.model,
+                sequence_id,
+                ctypes.byref(selected_token),
+                ctypes.byref(selected_logprob),
+                token_ids,
+                logprobs,
+                3,
+            )
+        )
+        self.assertEqual(selected, 3)
+        self.assertEqual(selected_token.value, selected)
+        self.assertEqual(count, 3)
+        self.assertEqual(list(token_ids), [3, 2, 1])
+        self.assertLessEqual(selected_logprob.value, 0.0)
+        self.assertGreater(logprobs[0], logprobs[1])
+        self.assertGreater(logprobs[1], logprobs[2])
+        LIB_LLAISYS.llaisysQwen2SequenceDestroy(self.model, sequence_id)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

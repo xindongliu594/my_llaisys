@@ -19,6 +19,51 @@ class ServerModel:
         return context + [token]
 
 
+class ServerBatchedModel(ServerModel):
+    supports_sequence_batching = True
+
+    def __init__(self):
+        self.sequences = set()
+        self.logprob_counts = {}
+        self.last_outputs = {}
+
+    @staticmethod
+    def estimate_kv_cache_bytes(capacity):
+        return capacity * 16
+
+    def create_sequence(self, sequence_id, capacity):
+        self.sequences.add(sequence_id)
+
+    def destroy_sequence(self, sequence_id):
+        self.sequences.discard(sequence_id)
+        self.logprob_counts.pop(sequence_id, None)
+        self.last_outputs.pop(sequence_id, None)
+
+    def configure_sequence_logprobs(self, sequence_id, top_n):
+        self.logprob_counts[sequence_id] = top_n
+
+    def get_sequence_logprobs(self, sequence_id, top_n):
+        token_id = self.last_outputs[sequence_id]
+        return {
+            "token_id": token_id,
+            "logprob": -0.25,
+            "top_logprobs": [
+                {"token_id": token_id + index, "logprob": -0.25 - index}
+                for index in range(top_n)
+            ],
+        }
+
+    def prefill_sequence(self, sequence_id, input_tokens, **_):
+        self.last_outputs[sequence_id] = 65
+        return 65
+
+    def decode_batch(self, sequence_ids, token_ids, sampling_configs):
+        del token_ids, sampling_configs
+        outputs = [self.eos_token_id] * len(sequence_ids)
+        self.last_outputs.update(zip(sequence_ids, outputs))
+        return outputs
+
+
 class ServerTokenizer:
     def apply_chat_template(
         self, conversation, add_generation_prompt=True, tokenize=False
@@ -266,6 +311,40 @@ class HTTPServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["text"], "A")
+
+    def test_orca_http_logprobs(self):
+        model = ServerBatchedModel()
+        scheduler = llaisys.OrcaScheduler(model)
+        chat = llaisys.ChatService(scheduler, ServerTokenizer())
+        server = llaisys.OpenAIAPIServer(
+            chat, model_id="logprob-model", host="127.0.0.1", port=0
+        )
+        server.start()
+        host, port = server.address
+        try:
+            request = urllib.request.Request(
+                f"http://{host}:{port}/v1/chat/completions",
+                data=json.dumps(
+                    {
+                        "model": "logprob-model",
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "max_tokens": 2,
+                        "logprobs": True,
+                        "top_logprobs": 2,
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                result = json.loads(response.read())
+        finally:
+            server.stop()
+        content = result["choices"][0]["logprobs"]["content"]
+        self.assertEqual(len(content), 2)
+        self.assertEqual(content[0]["token_id"], 65)
+        self.assertEqual(len(content[0]["top_logprobs"]), 2)
+        self.assertEqual(model.sequences, set())
 
     def test_z_readiness_and_draining_reject_new_work(self):
         status, _, body = self.request("GET", "/ready")

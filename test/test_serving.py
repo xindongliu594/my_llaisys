@@ -61,6 +61,8 @@ class BatchedStepModel(StepModel):
         super().__init__()
         self.sequences = set()
         self.batch_sizes = []
+        self.logprob_counts = {}
+        self.last_outputs = {}
 
     def create_sequence(self, sequence_id, capacity):
         assert capacity > 0
@@ -72,16 +74,37 @@ class BatchedStepModel(StepModel):
 
     def destroy_sequence(self, sequence_id):
         self.sequences.discard(sequence_id)
+        self.logprob_counts.pop(sequence_id, None)
+        self.last_outputs.pop(sequence_id, None)
+
+    def configure_sequence_logprobs(self, sequence_id, top_n):
+        self.logprob_counts[sequence_id] = top_n
+
+    def get_sequence_logprobs(self, sequence_id, top_n):
+        assert self.logprob_counts[sequence_id] == top_n
+        token_id = self.last_outputs[sequence_id]
+        return {
+            "token_id": token_id,
+            "logprob": -0.1,
+            "top_logprobs": [
+                {"token_id": token_id + index, "logprob": -0.1 - index}
+                for index in range(top_n)
+            ],
+        }
 
     def prefill_sequence(self, sequence_id, input_tokens, **_):
         assert sequence_id in self.sequences
-        return int(input_tokens[0]) * 10 + len(input_tokens)
+        output = int(input_tokens[0]) * 10 + len(input_tokens)
+        self.last_outputs[sequence_id] = output
+        return output
 
     def decode_batch(self, sequence_ids, token_ids, sampling_configs):
         assert len(sequence_ids) == len(token_ids) == len(sampling_configs)
         assert all(sequence_id in self.sequences for sequence_id in sequence_ids)
         self.batch_sizes.append(len(sequence_ids))
-        return [int(token) + 1 for token in token_ids]
+        outputs = [int(token) + 1 for token in token_ids]
+        self.last_outputs.update(zip(sequence_ids, outputs))
+        return outputs
 
 
 class SlowBatchedStepModel(BatchedStepModel):
@@ -406,6 +429,25 @@ class RoundRobinServingTest(unittest.TestCase):
 
 
 class OrcaServingTest(unittest.TestCase):
+    def test_logprobs_follow_tokens_and_stream_events(self):
+        model = BatchedStepModel()
+        scheduler = llaisys.OrcaScheduler(model)
+        scheduler.sessions.create("logprobs")
+        request = scheduler.submit(
+            "logprobs", [1], max_new_tokens=2, logprobs=2
+        )
+
+        events = list(scheduler.run_until_idle_stream())
+
+        self.assertEqual(len(request.generated_logprobs), 2)
+        self.assertEqual(
+            [item["token_id"] for item in request.generated_logprobs],
+            list(request.generated_tokens),
+        )
+        self.assertEqual(events[0].logprobs["token_id"], 11)
+        self.assertEqual(len(events[0].logprobs["top_logprobs"]), 2)
+        self.assertEqual(model.logprob_counts, {})
+
     def test_backend_oom_isolated_and_scheduler_keeps_running(self):
         model = OOMPrefillBatchedModel()
         scheduler = llaisys.OrcaScheduler(

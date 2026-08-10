@@ -664,6 +664,7 @@ class OpenAIAPIServer:
                                 "finish_reason": self._openai_reason(
                                     request.finish_reason
                                 ),
+                                "logprobs": self._request_logprobs(request),
                             }
                         ],
                         "usage": self._usage(request),
@@ -755,6 +756,7 @@ class OpenAIAPIServer:
                         "index": 0,
                         "message": {"role": "assistant", "content": content},
                         "finish_reason": self._openai_reason(request.finish_reason),
+                        "logprobs": self._request_logprobs(request),
                     }
                 ],
                 "usage": self._usage(request),
@@ -782,6 +784,7 @@ class OpenAIAPIServer:
                                 if event.finished
                                 else None
                             ),
+                            "logprobs": self._event_logprobs(event),
                         }
                     ],
                 }
@@ -812,6 +815,7 @@ class OpenAIAPIServer:
                                     if event.finished
                                     else None
                                 ),
+                                "logprobs": self._event_logprobs(event),
                             }
                         ],
                     },
@@ -933,6 +937,28 @@ class OpenAIAPIServer:
         ignore_eos = body.get("ignore_eos", False)
         if not isinstance(ignore_eos, bool):
             raise ValueError("ignore_eos must be a boolean")
+        raw_logprobs = body.get("logprobs", False)
+        raw_top_logprobs = body.get("top_logprobs", 0)
+        if isinstance(raw_logprobs, bool):
+            if isinstance(raw_top_logprobs, bool) or not isinstance(
+                raw_top_logprobs, int
+            ):
+                raise ValueError("top_logprobs must be an integer")
+            if not 0 <= raw_top_logprobs <= 20:
+                raise ValueError("top_logprobs must be between 0 and 20")
+            if raw_top_logprobs and not raw_logprobs:
+                raise ValueError("top_logprobs requires logprobs=true")
+            logprobs = max(1, raw_top_logprobs) if raw_logprobs else 0
+        elif isinstance(raw_logprobs, int):
+            if not 0 <= raw_logprobs <= 20:
+                raise ValueError("logprobs must be between 0 and 20")
+            if raw_top_logprobs:
+                raise ValueError(
+                    "top_logprobs is only valid when logprobs is a boolean"
+                )
+            logprobs = raw_logprobs
+        else:
+            raise ValueError("logprobs must be a boolean or integer")
         return {
             "max_new_tokens": max_tokens,
             "min_new_tokens": min_tokens,
@@ -941,6 +967,7 @@ class OpenAIAPIServer:
             "stop_strings": stop_strings,
             "truncate_prompt": truncate_prompt,
             "ignore_eos": ignore_eos,
+            "logprobs": logprobs,
             "timeout_seconds": timeout,
             **phase_timeouts,
             "top_k": top_k,
@@ -1038,6 +1065,54 @@ class OpenAIAPIServer:
             return "stop"
         return reason.value if reason is not None else None
 
+    def _format_token_logprobs(
+        self, token_logprobs: Mapping[str, object]
+    ) -> Dict[str, object]:
+        token_id = int(token_logprobs["token_id"])
+        token = self.chat.tokenizer.decode(
+            [token_id], skip_special_tokens=False
+        )
+        top = []
+        for candidate in token_logprobs.get("top_logprobs", []):
+            candidate_id = int(candidate["token_id"])
+            candidate_text = self.chat.tokenizer.decode(
+                [candidate_id], skip_special_tokens=False
+            )
+            top.append(
+                {
+                    "token": candidate_text,
+                    "token_id": candidate_id,
+                    "logprob": float(candidate["logprob"]),
+                    "bytes": list(candidate_text.encode("utf-8")),
+                }
+            )
+        return {
+            "token": token,
+            "token_id": token_id,
+            "logprob": float(token_logprobs["logprob"]),
+            "bytes": list(token.encode("utf-8")),
+            "top_logprobs": top,
+        }
+
+    def _event_logprobs(
+        self, event: TokenEvent
+    ) -> Optional[Dict[str, object]]:
+        if event.logprobs is None:
+            return None
+        return {"content": [self._format_token_logprobs(event.logprobs)]}
+
+    def _request_logprobs(
+        self, request: GenerationRequest
+    ) -> Optional[Dict[str, object]]:
+        if not request.generated_logprobs:
+            return None
+        return {
+            "content": [
+                self._format_token_logprobs(token_logprobs)
+                for token_logprobs in request.generated_logprobs
+            ]
+        }
+
     @classmethod
     def _request_json(cls, request: GenerationRequest) -> Dict[str, object]:
         now = time.time()
@@ -1072,6 +1147,7 @@ class OpenAIAPIServer:
             ),
             "timeout_phase": request.timeout_phase,
             "generated_tokens": list(request.generated_tokens),
+            "logprobs": list(request.generated_logprobs),
             "output_text": request.streamed_text,
             "usage": cls._usage(request),
             "timing": {

@@ -45,6 +45,11 @@ struct Qwen2SequenceState {
     std::mt19937_64 sampling_rng;
     uint64_t sampling_seed = 0;
     bool sampling_rng_initialized = false;
+    size_t requested_logprobs = 0;
+    int64_t selected_token = -1;
+    float selected_logprob = 0.0f;
+    std::vector<int64_t> top_logprob_tokens;
+    std::vector<float> top_logprobs;
 };
 
 struct LlaisysQwen2Model {
@@ -118,6 +123,18 @@ struct LlaisysQwen2Model {
         state.cache_len = 0;
         state.token_history.clear();
         state.sampling_rng_initialized = false;
+        state.selected_token = -1;
+        state.top_logprob_tokens.clear();
+        state.top_logprobs.clear();
+    }
+
+    void configureSequenceLogprobs(uint64_t sequence_id, size_t top_n) {
+        CHECK_ARGUMENT(top_n <= 20, "At most 20 top logprobs are supported");
+        auto &state = sequence(sequence_id);
+        state.requested_logprobs = top_n;
+        state.selected_token = -1;
+        state.top_logprob_tokens.clear();
+        state.top_logprobs.clear();
     }
 
     void allocateWeights() {
@@ -289,6 +306,9 @@ struct LlaisysQwen2Model {
         llaisys::core::context().runtime().api()->memcpy_sync(
             &result, max_index->data(), sizeof(result),
             device == LLAISYS_DEVICE_CPU ? LLAISYS_MEMCPY_H2H : LLAISYS_MEMCPY_D2H);
+        if (state.requested_logprobs > 0) {
+            captureLogprobs(state, copyLogitsToHost(logits), result);
+        }
         return result;
     }
 
@@ -416,6 +436,13 @@ struct LlaisysQwen2Model {
                 output_ids + i, max_index->data(), sizeof(int64_t),
                 device == LLAISYS_DEVICE_CPU ? LLAISYS_MEMCPY_H2H
                                              : LLAISYS_MEMCPY_D2H);
+            if (states[i]->requested_logprobs > 0) {
+                captureLogprobs(
+                    *states[i],
+                    copyLogitsToHost(
+                        logits->slice(0, i, i + 1)->view({meta.voc})),
+                    output_ids[i]);
+            }
         }
     }
 
@@ -451,6 +478,41 @@ struct LlaisysQwen2Model {
         default: EXCEPTION_UNSUPPORTED_DATATYPE(meta.dtype);
         }
         return scores;
+    }
+
+    void captureLogprobs(Qwen2SequenceState &state,
+                         const std::vector<float> &scores,
+                         int64_t selected) const {
+        if (state.requested_logprobs == 0 || scores.empty()) {
+            return;
+        }
+        const float maximum = *std::max_element(scores.begin(), scores.end());
+        double exponential_sum = 0.0;
+        for (float score : scores) {
+            exponential_sum += std::exp(static_cast<double>(score - maximum));
+        }
+        const double log_denominator =
+            static_cast<double>(maximum) + std::log(exponential_sum);
+        state.selected_token = selected;
+        state.selected_logprob = static_cast<float>(
+            static_cast<double>(scores.at(static_cast<size_t>(selected)))
+            - log_denominator);
+
+        std::vector<size_t> indices(scores.size());
+        std::iota(indices.begin(), indices.end(), 0);
+        const size_t count = std::min(state.requested_logprobs, scores.size());
+        std::partial_sort(
+            indices.begin(), indices.begin() + count, indices.end(),
+            [&scores](size_t left, size_t right) {
+                return scores[left] > scores[right];
+            });
+        state.top_logprob_tokens.resize(count);
+        state.top_logprobs.resize(count);
+        for (size_t i = 0; i < count; ++i) {
+            state.top_logprob_tokens[i] = static_cast<int64_t>(indices[i]);
+            state.top_logprobs[i] = static_cast<float>(
+                static_cast<double>(scores[indices[i]]) - log_denominator);
+        }
     }
 
     int64_t sample(Qwen2SequenceState &state, tensor_t logits,
@@ -517,7 +579,12 @@ struct LlaisysQwen2Model {
             state.sampling_rng_initialized = true;
         }
         std::discrete_distribution<size_t> distribution(weights.begin(), weights.begin() + kept);
-        return static_cast<int64_t>(indices[distribution(state.sampling_rng)]);
+        const int64_t selected = static_cast<int64_t>(
+            indices[distribution(state.sampling_rng)]);
+        if (state.requested_logprobs > 0) {
+            captureLogprobs(state, scores, selected);
+        }
+        return selected;
     }
 
     void inferBatchSample(const std::vector<Qwen2SequenceState *> &states,
@@ -622,6 +689,44 @@ __C {
             CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
             model->resetSequence(sequence_id);
             return 1;
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    int llaisysQwen2SequenceConfigureLogprobs(
+        LlaisysQwen2Model *model, uint64_t sequence_id, size_t top_n) {
+        try {
+            CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
+            model->configureSequenceLogprobs(sequence_id, top_n);
+            return 1;
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    size_t llaisysQwen2SequenceGetLogprobs(
+        LlaisysQwen2Model *model, uint64_t sequence_id,
+        int64_t *selected_token, float *selected_logprob,
+        int64_t *top_token_ids, float *top_logprobs, size_t capacity) {
+        try {
+            CHECK_ARGUMENT(model != nullptr && selected_token != nullptr
+                           && selected_logprob != nullptr,
+                           "Qwen2 logprob arguments must not be null");
+            auto &state = model->sequence(sequence_id);
+            CHECK_ARGUMENT(state.selected_token >= 0,
+                           "Qwen2 logprobs are not available");
+            *selected_token = state.selected_token;
+            *selected_logprob = state.selected_logprob;
+            const size_t count = std::min(capacity, state.top_logprobs.size());
+            CHECK_ARGUMENT(count == 0 || (top_token_ids != nullptr
+                           && top_logprobs != nullptr),
+                           "Qwen2 top-logprob outputs must not be null");
+            for (size_t i = 0; i < count; ++i) {
+                top_token_ids[i] = state.top_logprob_tokens[i];
+                top_logprobs[i] = state.top_logprobs[i];
+            }
+            return count;
         } catch (...) {
             return 0;
         }

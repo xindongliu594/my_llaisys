@@ -57,6 +57,10 @@ __C {
 
     __export int llaisysQwen2SequenceReset(struct LlaisysQwen2Model *model, uint64_t sequence_id);
 
+    __export int llaisysQwen2SequenceConfigureLogprobs(struct LlaisysQwen2Model *model, uint64_t sequence_id, size_t top_n);
+
+    __export size_t llaisysQwen2SequenceGetLogprobs(struct LlaisysQwen2Model *model, uint64_t sequence_id, int64_t *selected_token, float *selected_logprob, int64_t *top_token_ids, float *top_logprobs, size_t capacity);
+
     __export int64_t llaisysQwen2SequenceInfer(struct LlaisysQwen2Model *model, uint64_t sequence_id, int64_t *token_ids, size_t ntoken);
 
     __export int64_t llaisysQwen2SequenceInferSample(struct LlaisysQwen2Model *model, uint64_t sequence_id, int64_t *token_ids, size_t ntoken, const LlaisysSamplingConfig *config);

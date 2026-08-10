@@ -282,6 +282,55 @@ class Qwen2:
             if numeric_id is not None:
                 LIB_LLAISYS.llaisysQwen2SequenceDestroy(self._model, numeric_id)
 
+    def configure_sequence_logprobs(
+        self, sequence_id: str, top_n: int
+    ) -> None:
+        if not 1 <= top_n <= 20:
+            raise ValueError("top_n must be between 1 and 20")
+        with self._sequence_lock:
+            numeric_id = self._sequence_ids[str(sequence_id)]
+        succeeded = LIB_LLAISYS.llaisysQwen2SequenceConfigureLogprobs(
+            self._model, numeric_id, top_n
+        )
+        if not succeeded:
+            raise RuntimeError("Failed to configure Qwen2 sequence logprobs")
+
+    def get_sequence_logprobs(
+        self, sequence_id: str, top_n: int
+    ) -> dict[str, object]:
+        if not 1 <= top_n <= 20:
+            raise ValueError("top_n must be between 1 and 20")
+        with self._sequence_lock:
+            numeric_id = self._sequence_ids[str(sequence_id)]
+        selected_token = ctypes.c_int64()
+        selected_logprob = ctypes.c_float()
+        token_ids = (ctypes.c_int64 * top_n)()
+        logprobs = (ctypes.c_float * top_n)()
+        count = int(
+            LIB_LLAISYS.llaisysQwen2SequenceGetLogprobs(
+                self._model,
+                numeric_id,
+                ctypes.byref(selected_token),
+                ctypes.byref(selected_logprob),
+                token_ids,
+                logprobs,
+                top_n,
+            )
+        )
+        if count <= 0:
+            raise RuntimeError("Qwen2 sequence logprobs are unavailable")
+        return {
+            "token_id": int(selected_token.value),
+            "logprob": float(selected_logprob.value),
+            "top_logprobs": [
+                {
+                    "token_id": int(token_ids[index]),
+                    "logprob": float(logprobs[index]),
+                }
+                for index in range(count)
+            ],
+        }
+
     @staticmethod
     def _sampling_config(
         top_k: int,
