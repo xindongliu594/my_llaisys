@@ -78,6 +78,10 @@ def compare_schedulers(
             results[name] = compact
         finally:
             server.stop(graceful=True, timeout_seconds=600.0)
+        del server
+        del chat
+        del scheduler
+        gc.collect()
 
     baseline = results["round_robin"]
     orca = results["orca"]
