@@ -1062,6 +1062,7 @@ class OrcaScheduler(RoundRobinScheduler):
         )
         self.model: SequenceBatchModel = model
         self.max_prefill_per_iteration = max_prefill_per_iteration
+        self.decode_batch_sizes: Deque[int] = deque(maxlen=10000)
 
     @staticmethod
     def _sampling_args(request: GenerationRequest) -> Dict[str, object]:
@@ -1168,6 +1169,7 @@ class OrcaScheduler(RoundRobinScheduler):
                     survivors.append(request.request_id)
 
             if decode_requests:
+                self.decode_batch_sizes.append(len(decode_requests))
                 try:
                     output_ids = self.model.decode_batch(
                         [request.request_id for request in decode_requests],
