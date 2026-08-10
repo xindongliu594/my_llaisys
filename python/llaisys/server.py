@@ -24,6 +24,7 @@ from .serving import (
     ChatService,
     FinishReason,
     GenerationRequest,
+    OrcaScheduler,
     RequestPool,
     RequestStatus,
     RoundRobinScheduler,
@@ -986,6 +987,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--model-id", default=None)
     parser.add_argument("--max-queue-size", type=int, default=256)
     parser.add_argument("--max-active-requests", type=int, default=32)
+    parser.add_argument(
+        "--scheduler", choices=("orca", "round-robin"), default="orca"
+    )
+    parser.add_argument("--max-prefill-per-iteration", type=int, default=1)
     args = parser.parse_args(argv)
 
     # Imported lazily so importing llaisys.server does not require transformers.
@@ -1000,11 +1005,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     model = Qwen2(args.model, device)
     request_pool = RequestPool(max_pending_requests=args.max_queue_size)
-    scheduler = RoundRobinScheduler(
-        model,
-        request_pool=request_pool,
-        max_active_requests=args.max_active_requests,
-    )
+    if args.scheduler == "orca":
+        scheduler = OrcaScheduler(
+            model,
+            request_pool=request_pool,
+            max_active_requests=args.max_active_requests,
+            max_prefill_per_iteration=args.max_prefill_per_iteration,
+        )
+    else:
+        scheduler = RoundRobinScheduler(
+            model,
+            request_pool=request_pool,
+            max_active_requests=args.max_active_requests,
+        )
     chat = ChatService(scheduler, tokenizer)
     server = OpenAIAPIServer(
         chat,

@@ -86,3 +86,58 @@ def load_models(lib):
         ctypes.POINTER(LlaisysSamplingConfig),
     ]
     lib.llaisysQwen2ModelInferSample.restype = ctypes.c_int64
+
+    lib.llaisysQwen2SequenceCreate.argtypes = [
+        LlaisysQwen2Model,
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+    ]
+    lib.llaisysQwen2SequenceCreate.restype = ctypes.c_int
+
+    lib.llaisysQwen2SequenceDestroy.argtypes = [
+        LlaisysQwen2Model,
+        ctypes.c_uint64,
+    ]
+    lib.llaisysQwen2SequenceDestroy.restype = None
+
+    lib.llaisysQwen2SequenceReset.argtypes = [
+        LlaisysQwen2Model,
+        ctypes.c_uint64,
+    ]
+    lib.llaisysQwen2SequenceReset.restype = ctypes.c_int
+
+    lib.llaisysQwen2SequenceInfer.argtypes = [
+        LlaisysQwen2Model,
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_size_t,
+    ]
+    lib.llaisysQwen2SequenceInfer.restype = ctypes.c_int64
+
+    lib.llaisysQwen2SequenceInferSample.argtypes = [
+        LlaisysQwen2Model,
+        ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_size_t,
+        ctypes.POINTER(LlaisysSamplingConfig),
+    ]
+    lib.llaisysQwen2SequenceInferSample.restype = ctypes.c_int64
+
+    lib.llaisysQwen2BatchInfer.argtypes = [
+        LlaisysQwen2Model,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int64),
+    ]
+    lib.llaisysQwen2BatchInfer.restype = ctypes.c_int
+
+    lib.llaisysQwen2BatchInferSample.argtypes = [
+        LlaisysQwen2Model,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_int64),
+        ctypes.c_size_t,
+        ctypes.POINTER(LlaisysSamplingConfig),
+        ctypes.POINTER(ctypes.c_int64),
+    ]
+    lib.llaisysQwen2BatchInferSample.restype = ctypes.c_int

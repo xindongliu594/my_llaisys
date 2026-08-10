@@ -85,6 +85,45 @@ class SamplingBackendTest(unittest.TestCase):
         result = self._sample(3, top_k=1, repetition_penalty=100.0)
         self.assertEqual(result, 2)
 
+    def test_independent_sequence_cache_and_batched_decode(self):
+        self.assertTrue(
+            LIB_LLAISYS.llaisysQwen2SequenceCreate(self.model, 101, 4)
+        )
+        self.assertTrue(
+            LIB_LLAISYS.llaisysQwen2SequenceCreate(self.model, 202, 4)
+        )
+        first_prompt = ctypes.c_int64(0)
+        second_prompt = ctypes.c_int64(1)
+        self.assertEqual(
+            LIB_LLAISYS.llaisysQwen2SequenceInfer(
+                self.model, 101, ctypes.byref(first_prompt), 1
+            ),
+            3,
+        )
+        self.assertEqual(
+            LIB_LLAISYS.llaisysQwen2SequenceInfer(
+                self.model, 202, ctypes.byref(second_prompt), 1
+            ),
+            3,
+        )
+
+        sequence_ids = (ctypes.c_uint64 * 2)(101, 202)
+        input_tokens = (ctypes.c_int64 * 2)(3, 3)
+        output_tokens = (ctypes.c_int64 * 2)()
+        self.assertTrue(
+            LIB_LLAISYS.llaisysQwen2BatchInfer(
+                self.model,
+                sequence_ids,
+                input_tokens,
+                2,
+                output_tokens,
+            )
+        )
+        self.assertEqual(list(output_tokens), [3, 3])
+
+        LIB_LLAISYS.llaisysQwen2SequenceDestroy(self.model, 101)
+        LIB_LLAISYS.llaisysQwen2SequenceDestroy(self.model, 202)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

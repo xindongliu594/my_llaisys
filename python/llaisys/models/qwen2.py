@@ -4,7 +4,7 @@ import mmap
 import re
 import struct
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -31,6 +31,8 @@ class Qwen2:
 
     def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
         self._model = None
+        self._sequence_ids = {}
+        self._next_sequence_id = 1
         self._device = DeviceType(device)
         model_path = Path(model_path)
         with (model_path / "config.json").open("r", encoding="utf-8") as file:
@@ -214,3 +216,132 @@ class Qwen2:
             if next_token < 0:
                 raise RuntimeError("Qwen2 backend inference failed during decode")
         return output
+
+    @property
+    def supports_sequence_batching(self) -> bool:
+        return True
+
+    def create_sequence(self, sequence_id: str, capacity: int) -> None:
+        key = str(sequence_id)
+        if key in self._sequence_ids:
+            raise ValueError(f"Sequence already exists: {key}")
+        if not 0 < capacity <= self.max_sequence_length:
+            raise ValueError("Sequence capacity is outside the model limit")
+        numeric_id = self._next_sequence_id
+        self._next_sequence_id += 1
+        created = LIB_LLAISYS.llaisysQwen2SequenceCreate(
+            self._model, numeric_id, capacity
+        )
+        if not created:
+            raise RuntimeError("Failed to allocate sequence KV cache")
+        self._sequence_ids[key] = numeric_id
+
+    def destroy_sequence(self, sequence_id: str) -> None:
+        numeric_id = self._sequence_ids.pop(str(sequence_id), None)
+        if numeric_id is not None:
+            LIB_LLAISYS.llaisysQwen2SequenceDestroy(self._model, numeric_id)
+
+    @staticmethod
+    def _sampling_config(
+        top_k: int,
+        top_p: float,
+        temperature: float,
+        repetition_penalty: float,
+        seed: int,
+    ) -> LlaisysSamplingConfig:
+        return LlaisysSamplingConfig(
+            temperature=float(temperature),
+            top_k=int(top_k),
+            top_p=float(top_p),
+            repetition_penalty=float(repetition_penalty),
+            seed=int(seed),
+        )
+
+    def prefill_sequence(
+        self,
+        sequence_id: str,
+        input_tokens: Sequence[int],
+        top_k: int = 1,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+        repetition_penalty: float = 1.0,
+        seed: int = 0,
+    ) -> int:
+        numeric_id = self._sequence_ids[str(sequence_id)]
+        tokens = [int(token) for token in input_tokens]
+        if not tokens:
+            raise ValueError("Prefill requires at least one token")
+        token_array = (ctypes.c_int64 * len(tokens))(*tokens)
+        config = self._sampling_config(
+            top_k, top_p, temperature, repetition_penalty, seed
+        )
+        greedy = top_k == 1 and repetition_penalty == 1.0
+        result = int(
+            LIB_LLAISYS.llaisysQwen2SequenceInfer(
+                self._model, numeric_id, token_array, len(tokens)
+            )
+            if greedy
+            else LIB_LLAISYS.llaisysQwen2SequenceInferSample(
+                self._model,
+                numeric_id,
+                token_array,
+                len(tokens),
+                ctypes.byref(config),
+            )
+        )
+        if result < 0:
+            raise RuntimeError("Qwen2 sequence prefill failed")
+        return result
+
+    def decode_batch(
+        self,
+        sequence_ids: Sequence[str],
+        token_ids: Sequence[int],
+        sampling_configs: Sequence[Mapping[str, object]],
+    ) -> list[int]:
+        if not sequence_ids or not (
+            len(sequence_ids) == len(token_ids) == len(sampling_configs)
+        ):
+            raise ValueError("Batch sequence, token, and config lengths must match")
+        numeric_ids = [self._sequence_ids[str(key)] for key in sequence_ids]
+        batch_size = len(numeric_ids)
+        id_array = (ctypes.c_uint64 * batch_size)(*numeric_ids)
+        token_array = (ctypes.c_int64 * batch_size)(
+            *(int(token) for token in token_ids)
+        )
+        output_array = (ctypes.c_int64 * batch_size)()
+        configs = [
+            self._sampling_config(
+                int(config["top_k"]),
+                float(config["top_p"]),
+                float(config["temperature"]),
+                float(config["repetition_penalty"]),
+                int(config["seed"]),
+            )
+            for config in sampling_configs
+        ]
+        greedy = all(
+            config.top_k == 1 and config.repetition_penalty == 1.0
+            for config in configs
+        )
+        if greedy:
+            succeeded = LIB_LLAISYS.llaisysQwen2BatchInfer(
+                self._model,
+                id_array,
+                token_array,
+                batch_size,
+                output_array,
+            )
+        else:
+            config_array = (LlaisysSamplingConfig * batch_size)(*configs)
+            succeeded = LIB_LLAISYS.llaisysQwen2BatchInferSample(
+                self._model,
+                id_array,
+                token_array,
+                batch_size,
+                config_array,
+                output_array,
+            )
+        if not succeeded:
+            raise RuntimeError("Qwen2 batched decode failed")
+        return [int(token) for token in output_array]

@@ -35,6 +35,32 @@ class GenerationModel(Protocol):
     ) -> Sequence[int]: ...
 
 
+class SequenceBatchModel(GenerationModel, Protocol):
+    supports_sequence_batching: bool
+
+    def create_sequence(self, sequence_id: str, capacity: int) -> None: ...
+
+    def destroy_sequence(self, sequence_id: str) -> None: ...
+
+    def prefill_sequence(
+        self,
+        sequence_id: str,
+        input_tokens: Sequence[int],
+        top_k: int = 1,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+        repetition_penalty: float = 1.0,
+        seed: int = 0,
+    ) -> int: ...
+
+    def decode_batch(
+        self,
+        sequence_ids: Sequence[str],
+        token_ids: Sequence[int],
+        sampling_configs: Sequence[Mapping[str, object]],
+    ) -> Sequence[int]: ...
+
+
 class ChatTokenizer(Protocol):
     def apply_chat_template(
         self,
@@ -996,6 +1022,236 @@ class RoundRobinScheduler(RequestScheduler):
     def _publish(self, event: TokenEvent) -> None:
         with self._events_lock:
             self._event_queues[event.request_id].put(event)
+
+
+class OrcaScheduler(RoundRobinScheduler):
+    """Iteration-level scheduler with persistent per-sequence KV caches.
+
+    Prefill is admitted selectively while all already-prefilled sequences are
+    decoded together in one model call. Finished sequences leave immediately,
+    and waiting sequences can join the next iteration.
+    """
+
+    supports_continuous_batching = True
+
+    def __init__(
+        self,
+        model: SequenceBatchModel,
+        sessions: Optional[SessionManager] = None,
+        request_pool: Optional[RequestPool] = None,
+        token_decoder: Optional[Callable[[int], str]] = None,
+        sequence_decoder: Optional[Callable[[Sequence[int]], str]] = None,
+        commit_partial_on_abort: bool = True,
+        max_sequence_length: Optional[int] = None,
+        max_active_requests: Optional[int] = 32,
+        max_prefill_per_iteration: int = 1,
+    ) -> None:
+        if not getattr(model, "supports_sequence_batching", False):
+            raise ValueError("OrcaScheduler requires a sequence-batched model")
+        if max_prefill_per_iteration <= 0:
+            raise ValueError("max_prefill_per_iteration must be positive")
+        super().__init__(
+            model,
+            sessions=sessions,
+            request_pool=request_pool,
+            token_decoder=token_decoder,
+            sequence_decoder=sequence_decoder,
+            commit_partial_on_abort=commit_partial_on_abort,
+            max_sequence_length=max_sequence_length,
+            max_active_requests=max_active_requests,
+        )
+        self.model: SequenceBatchModel = model
+        self.max_prefill_per_iteration = max_prefill_per_iteration
+
+    @staticmethod
+    def _sampling_args(request: GenerationRequest) -> Dict[str, object]:
+        return {
+            "top_k": request.top_k,
+            "top_p": request.top_p,
+            "temperature": request.temperature,
+            "repetition_penalty": request.repetition_penalty,
+            "seed": request.seed,
+        }
+
+    def _accept_generated_token(
+        self, request: GenerationRequest, token_id: int
+    ) -> TokenEvent:
+        request.generated_token_ids.append(int(token_id))
+        if request.first_token_at is None:
+            request.first_token_at = time.time()
+        reason = self._finish_reason(request, int(token_id))
+        text, stopped_by_string = self._decode_increment(
+            request, force_flush=reason is not None
+        )
+        if stopped_by_string:
+            reason = FinishReason.STOP
+        if reason is not None:
+            return self._finalize_success(
+                request, reason, token_id=int(token_id), text=text
+            )
+        event = TokenEvent(
+            request_id=request.request_id,
+            session_id=request.session_id,
+            token_id=int(token_id),
+            text=text,
+        )
+        self._publish(event)
+        return event
+
+    def step_batch(self) -> List[TokenEvent]:
+        """Runs one Orca iteration and returns every event from that iteration."""
+
+        with self._worker_lock:
+            self._admit_waiting()
+            active_ids = list(self._active)
+            self._active.clear()
+            if not active_ids:
+                return []
+
+            events: List[TokenEvent] = []
+            survivors: List[str] = []
+            decode_requests: List[GenerationRequest] = []
+            prefills = 0
+
+            for request_id in active_ids:
+                request = self.request_pool.get(request_id)
+                if request.status is not RequestStatus.RUNNING:
+                    continue
+                if request.cancel_requested:
+                    events.append(
+                        self._finalize_abort(request, FinishReason.CANCELLED)
+                    )
+                    continue
+                if request.deadline is not None and time.time() >= request.deadline:
+                    events.append(
+                        self._finalize_abort(request, FinishReason.TIMEOUT)
+                    )
+                    continue
+                if request.context_tokens is not None:
+                    decode_requests.append(request)
+                    continue
+                if prefills >= self.max_prefill_per_iteration:
+                    survivors.append(request.request_id)
+                    continue
+
+                prefills += 1
+                try:
+                    context = self._build_context(request)
+                    request.context_tokens = context
+                    request.context_length = len(context)
+                    self.model.create_sequence(
+                        request.request_id,
+                        len(context) + request.max_new_tokens,
+                    )
+                    token_id = self.model.prefill_sequence(
+                        request.request_id,
+                        context,
+                        **self._sampling_args(request),
+                    )
+                    if request.cancel_requested:
+                        event = self._finalize_abort(
+                            request, FinishReason.CANCELLED
+                        )
+                    elif (
+                        request.deadline is not None
+                        and time.time() >= request.deadline
+                    ):
+                        event = self._finalize_abort(
+                            request, FinishReason.TIMEOUT
+                        )
+                    else:
+                        event = self._accept_generated_token(request, token_id)
+                except Exception as error:
+                    event = self._finalize_error(request, error)
+                events.append(event)
+                if request.status is RequestStatus.RUNNING:
+                    survivors.append(request.request_id)
+
+            if decode_requests:
+                try:
+                    output_ids = self.model.decode_batch(
+                        [request.request_id for request in decode_requests],
+                        [request.generated_token_ids[-1] for request in decode_requests],
+                        [self._sampling_args(request) for request in decode_requests],
+                    )
+                    if len(output_ids) != len(decode_requests):
+                        raise RuntimeError("Batched decode returned the wrong size")
+                    for request, token_id in zip(decode_requests, output_ids):
+                        if request.cancel_requested:
+                            event = self._finalize_abort(
+                                request, FinishReason.CANCELLED
+                            )
+                        elif (
+                            request.deadline is not None
+                            and time.time() >= request.deadline
+                        ):
+                            event = self._finalize_abort(
+                                request, FinishReason.TIMEOUT
+                            )
+                        else:
+                            event = self._accept_generated_token(
+                                request, int(token_id)
+                            )
+                        events.append(event)
+                        if request.status is RequestStatus.RUNNING:
+                            survivors.append(request.request_id)
+                except Exception as error:
+                    for request in decode_requests:
+                        if request.status is RequestStatus.RUNNING:
+                            events.append(self._finalize_error(request, error))
+
+            self._active.extend(survivors)
+            return events
+
+    def step(self) -> Optional[TokenEvent]:
+        events = self.step_batch()
+        return events[0] if events else None
+
+    def run_until_idle_stream(self) -> Iterator[TokenEvent]:
+        while True:
+            events = self.step_batch()
+            if not events:
+                return
+            yield from events
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            if not self.step_batch():
+                self._wake_event.wait(timeout=0.05)
+                self._wake_event.clear()
+
+    def _destroy_model_sequence(self, request: GenerationRequest) -> None:
+        self.model.destroy_sequence(request.request_id)
+
+    def _finalize_success(
+        self,
+        request: GenerationRequest,
+        reason: FinishReason,
+        token_id: Optional[int] = None,
+        text: Optional[str] = None,
+    ) -> TokenEvent:
+        try:
+            return super()._finalize_success(
+                request, reason, token_id=token_id, text=text
+            )
+        finally:
+            self._destroy_model_sequence(request)
+
+    def _finalize_abort(
+        self, request: GenerationRequest, reason: FinishReason
+    ) -> TokenEvent:
+        try:
+            return super()._finalize_abort(request, reason)
+        finally:
+            self._destroy_model_sequence(request)
+
+    def _finalize_error(
+        self, request: GenerationRequest, error: Exception
+    ) -> TokenEvent:
+        try:
+            return super()._finalize_error(request, error)
+        finally:
+            self._destroy_model_sequence(request)
 
 
 class ChatService:

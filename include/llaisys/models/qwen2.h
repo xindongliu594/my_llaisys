@@ -50,5 +50,19 @@ __C {
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
 
     __export int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken, const LlaisysSamplingConfig * config);
+
+    __export int llaisysQwen2SequenceCreate(struct LlaisysQwen2Model *model, uint64_t sequence_id, size_t capacity);
+
+    __export void llaisysQwen2SequenceDestroy(struct LlaisysQwen2Model *model, uint64_t sequence_id);
+
+    __export int llaisysQwen2SequenceReset(struct LlaisysQwen2Model *model, uint64_t sequence_id);
+
+    __export int64_t llaisysQwen2SequenceInfer(struct LlaisysQwen2Model *model, uint64_t sequence_id, int64_t *token_ids, size_t ntoken);
+
+    __export int64_t llaisysQwen2SequenceInferSample(struct LlaisysQwen2Model *model, uint64_t sequence_id, int64_t *token_ids, size_t ntoken, const LlaisysSamplingConfig *config);
+
+    __export int llaisysQwen2BatchInfer(struct LlaisysQwen2Model *model, const uint64_t *sequence_ids, const int64_t *token_ids, size_t batch_size, int64_t *output_ids);
+
+    __export int llaisysQwen2BatchInferSample(struct LlaisysQwen2Model *model, const uint64_t *sequence_ids, const int64_t *token_ids, size_t batch_size, const LlaisysSamplingConfig *configs, int64_t *output_ids);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

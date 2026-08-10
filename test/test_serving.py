@@ -54,6 +54,32 @@ class StepModel:
         return context + [token]
 
 
+class BatchedStepModel(StepModel):
+    supports_sequence_batching = True
+
+    def __init__(self):
+        super().__init__()
+        self.sequences = set()
+        self.batch_sizes = []
+
+    def create_sequence(self, sequence_id, capacity):
+        assert capacity > 0
+        self.sequences.add(sequence_id)
+
+    def destroy_sequence(self, sequence_id):
+        self.sequences.discard(sequence_id)
+
+    def prefill_sequence(self, sequence_id, input_tokens, **_):
+        assert sequence_id in self.sequences
+        return int(input_tokens[0]) * 10 + len(input_tokens)
+
+    def decode_batch(self, sequence_ids, token_ids, sampling_configs):
+        assert len(sequence_ids) == len(token_ids) == len(sampling_configs)
+        assert all(sequence_id in self.sequences for sequence_id in sequence_ids)
+        self.batch_sizes.append(len(sequence_ids))
+        return [int(token) + 1 for token in token_ids]
+
+
 class FakeTokenizer:
     def __init__(self):
         self.conversations = []
@@ -215,6 +241,7 @@ class RoundRobinServingTest(unittest.TestCase):
         self.assertEqual(request.streamed_text, "answer")
         self.assertEqual(request.generated_tokens, (10, 11))
 
+
     def test_priority_admission_then_round_robin_stream(self):
         model = StepModel()
         scheduler = llaisys.RoundRobinScheduler(model)
@@ -330,6 +357,29 @@ class RoundRobinServingTest(unittest.TestCase):
         self.assertEqual([event.token_id for event in events], [11, 12])
         self.assertEqual([event.text for event in events], ["<11>", "<12>"])
         self.assertTrue(events[-1].finished)
+
+
+class OrcaServingTest(unittest.TestCase):
+    def test_dynamic_iteration_batching_and_sequence_cleanup(self):
+        model = BatchedStepModel()
+        scheduler = llaisys.OrcaScheduler(
+            model, max_active_requests=2, max_prefill_per_iteration=1
+        )
+        scheduler.sessions.create("a", initial_tokens=[1])
+        scheduler.sessions.create("b", initial_tokens=[2])
+        request_a = scheduler.submit("a", [], max_new_tokens=3)
+        request_b = scheduler.submit("b", [], max_new_tokens=3)
+
+        events = list(scheduler.run_until_idle_stream())
+
+        self.assertTrue(scheduler.supports_continuous_batching)
+        self.assertEqual(request_a.generated_tokens, (11, 12, 13))
+        self.assertEqual(request_b.generated_tokens, (21, 22, 23))
+        self.assertEqual(model.batch_sizes, [1, 2, 1])
+        self.assertEqual(model.sequences, set())
+        self.assertEqual(len(events), 6)
+        self.assertEqual(request_a.status, llaisys.RequestStatus.FINISHED)
+        self.assertEqual(request_b.status, llaisys.RequestStatus.FINISHED)
 
 
 class ChatServiceTest(unittest.TestCase):

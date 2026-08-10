@@ -18,6 +18,7 @@
 #include <numeric>
 #include <memory>
 #include <random>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -35,28 +36,28 @@ tensor_t tensor(llaisysTensor_t handle) {
 
 } // namespace
 
-struct LlaisysQwen2Model {
-    LlaisysQwen2Meta meta;
-    llaisysDeviceType_t device;
-    int device_id;
-    size_t cache_len;
-    LlaisysQwen2Weights weights{};
+struct Qwen2SequenceState {
+    size_t capacity = 0;
+    size_t cache_len = 0;
     std::vector<tensor_t> key_cache;
     std::vector<tensor_t> value_cache;
     std::vector<int64_t> token_history;
     std::mt19937_64 sampling_rng;
     uint64_t sampling_seed = 0;
     bool sampling_rng_initialized = false;
+};
+
+struct LlaisysQwen2Model {
+    LlaisysQwen2Meta meta;
+    llaisysDeviceType_t device;
+    int device_id;
+    LlaisysQwen2Weights weights{};
+    std::unique_ptr<Qwen2SequenceState> legacy_sequence;
+    std::unordered_map<uint64_t, std::unique_ptr<Qwen2SequenceState>> sequences;
 
     LlaisysQwen2Model(const LlaisysQwen2Meta &meta_, llaisysDeviceType_t device_, int device_id_)
-        : meta(meta_), device(device_), device_id(device_id_), cache_len(0) {
+        : meta(meta_), device(device_), device_id(device_id_) {
         allocateWeights();
-        key_cache.reserve(meta.nlayer);
-        value_cache.reserve(meta.nlayer);
-        for (size_t layer = 0; layer < meta.nlayer; ++layer) {
-            key_cache.push_back(create({meta.maxseq, meta.nkvh, meta.dh}));
-            value_cache.push_back(create({meta.maxseq, meta.nkvh, meta.dh}));
-        }
     }
 
     ~LlaisysQwen2Model() {
@@ -73,6 +74,50 @@ struct LlaisysQwen2Model {
 
     llaisysTensor_t createWeight(const std::vector<size_t> &shape) const {
         return wrap(create(shape));
+    }
+
+    std::unique_ptr<Qwen2SequenceState> createSequenceState(size_t capacity) const {
+        CHECK_ARGUMENT(capacity > 0 && capacity <= meta.maxseq,
+                       "Qwen2 sequence capacity is invalid");
+        auto state = std::make_unique<Qwen2SequenceState>();
+        state->capacity = capacity;
+        state->key_cache.reserve(meta.nlayer);
+        state->value_cache.reserve(meta.nlayer);
+        for (size_t layer = 0; layer < meta.nlayer; ++layer) {
+            state->key_cache.push_back(create({capacity, meta.nkvh, meta.dh}));
+            state->value_cache.push_back(create({capacity, meta.nkvh, meta.dh}));
+        }
+        return state;
+    }
+
+    Qwen2SequenceState &legacyState() {
+        if (!legacy_sequence) {
+            legacy_sequence = createSequenceState(meta.maxseq);
+        }
+        return *legacy_sequence;
+    }
+
+    Qwen2SequenceState &sequence(uint64_t sequence_id) {
+        auto found = sequences.find(sequence_id);
+        CHECK_ARGUMENT(found != sequences.end(), "Unknown Qwen2 sequence");
+        return *found->second;
+    }
+
+    void createSequence(uint64_t sequence_id, size_t capacity) {
+        CHECK_ARGUMENT(sequences.find(sequence_id) == sequences.end(),
+                       "Qwen2 sequence already exists");
+        sequences.emplace(sequence_id, createSequenceState(capacity));
+    }
+
+    void destroySequence(uint64_t sequence_id) {
+        sequences.erase(sequence_id);
+    }
+
+    void resetSequence(uint64_t sequence_id) {
+        auto &state = sequence(sequence_id);
+        state.cache_len = 0;
+        state.token_history.clear();
+        state.sampling_rng_initialized = false;
     }
 
     void allocateWeights() {
@@ -148,9 +193,11 @@ struct LlaisysQwen2Model {
             LLAISYS_MEMCPY_D2D);
     }
 
-    tensor_t forward(const int64_t *token_ids, size_t token_count) {
+    tensor_t forward(Qwen2SequenceState &state, const int64_t *token_ids,
+                     size_t token_count) {
         CHECK_ARGUMENT(token_ids != nullptr && token_count > 0, "Qwen2 inference requires input tokens");
-        CHECK_ARGUMENT(cache_len + token_count <= meta.maxseq, "Qwen2 KV cache capacity exceeded");
+        CHECK_ARGUMENT(state.cache_len + token_count <= state.capacity,
+                       "Qwen2 KV cache capacity exceeded");
 
         auto token_tensor = create({token_count}, LLAISYS_DTYPE_I64);
         token_tensor->load(token_ids);
@@ -159,7 +206,7 @@ struct LlaisysQwen2Model {
 
         std::vector<int64_t> positions(token_count);
         for (size_t i = 0; i < token_count; ++i) {
-            positions[i] = static_cast<int64_t>(cache_len + i);
+            positions[i] = static_cast<int64_t>(state.cache_len + i);
         }
         auto position_tensor = create({token_count}, LLAISYS_DTYPE_I64);
         position_tensor->load(positions.data());
@@ -184,10 +231,16 @@ struct LlaisysQwen2Model {
             llaisys::ops::rope(rotated_query, query, position_tensor, meta.theta);
             llaisys::ops::rope(rotated_key, key, position_tensor, meta.theta);
 
-            copy(key_cache[layer]->slice(0, cache_len, cache_len + token_count), rotated_key);
-            copy(value_cache[layer]->slice(0, cache_len, cache_len + token_count), value);
-            auto all_keys = key_cache[layer]->slice(0, 0, cache_len + token_count);
-            auto all_values = value_cache[layer]->slice(0, 0, cache_len + token_count);
+            copy(state.key_cache[layer]->slice(0, state.cache_len,
+                                               state.cache_len + token_count),
+                 rotated_key);
+            copy(state.value_cache[layer]->slice(0, state.cache_len,
+                                                 state.cache_len + token_count),
+                 value);
+            auto all_keys = state.key_cache[layer]->slice(
+                0, 0, state.cache_len + token_count);
+            auto all_values = state.value_cache[layer]->slice(
+                0, 0, state.cache_len + token_count);
 
             auto attention = create({token_count, meta.nh, meta.dh});
             llaisys::ops::self_attention(attention, rotated_query, all_keys, all_values,
@@ -213,8 +266,9 @@ struct LlaisysQwen2Model {
             llaisys::ops::add(hidden, residual, mlp_output);
         }
 
-        cache_len += token_count;
-        token_history.insert(token_history.end(), token_ids, token_ids + token_count);
+        state.cache_len += token_count;
+        state.token_history.insert(state.token_history.end(), token_ids,
+                                   token_ids + token_count);
         auto last_hidden = hidden->slice(0, token_count - 1, token_count);
         auto final_hidden = create({1, meta.hs});
         llaisys::ops::rms_norm(final_hidden, last_hidden, tensor(weights.out_norm_w), meta.epsilon);
@@ -223,8 +277,9 @@ struct LlaisysQwen2Model {
         return logits;
     }
 
-    int64_t inferGreedy(const int64_t *token_ids, size_t token_count) {
-        auto logits = forward(token_ids, token_count);
+    int64_t inferGreedy(Qwen2SequenceState &state, const int64_t *token_ids,
+                        size_t token_count) {
+        auto logits = forward(state, token_ids, token_count);
         auto max_index = create({1}, LLAISYS_DTYPE_I64);
         auto max_value = create({1});
         llaisys::ops::argmax(max_index, max_value, logits->view({meta.voc}));
@@ -235,6 +290,133 @@ struct LlaisysQwen2Model {
             &result, max_index->data(), sizeof(result),
             device == LLAISYS_DEVICE_CPU ? LLAISYS_MEMCPY_H2H : LLAISYS_MEMCPY_D2H);
         return result;
+    }
+
+    tensor_t forwardBatch(const std::vector<Qwen2SequenceState *> &states,
+                          const int64_t *token_ids) {
+        const size_t batch_size = states.size();
+        CHECK_ARGUMENT(batch_size > 0 && token_ids != nullptr,
+                       "Qwen2 batch inference requires inputs");
+        for (const auto *state : states) {
+            CHECK_ARGUMENT(state != nullptr && state->cache_len < state->capacity,
+                           "Qwen2 batch sequence capacity exceeded");
+        }
+
+        auto token_tensor = create({batch_size}, LLAISYS_DTYPE_I64);
+        token_tensor->load(token_ids);
+        auto hidden = create({batch_size, meta.hs});
+        llaisys::ops::embedding(hidden, token_tensor, tensor(weights.in_embed));
+
+        std::vector<int64_t> positions(batch_size);
+        for (size_t i = 0; i < batch_size; ++i) {
+            positions[i] = static_cast<int64_t>(states[i]->cache_len);
+        }
+        auto position_tensor = create({batch_size}, LLAISYS_DTYPE_I64);
+        position_tensor->load(positions.data());
+
+        for (size_t layer = 0; layer < meta.nlayer; ++layer) {
+            auto residual = hidden;
+            auto normalized = create({batch_size, meta.hs});
+            llaisys::ops::rms_norm(normalized, hidden,
+                                   tensor(weights.attn_norm_w[layer]),
+                                   meta.epsilon);
+
+            auto query_2d = create({batch_size, meta.nh * meta.dh});
+            auto key_2d = create({batch_size, meta.nkvh * meta.dh});
+            auto value_2d = create({batch_size, meta.nkvh * meta.dh});
+            llaisys::ops::linear(query_2d, normalized,
+                                 tensor(weights.attn_q_w[layer]),
+                                 tensor(weights.attn_q_b[layer]));
+            llaisys::ops::linear(key_2d, normalized,
+                                 tensor(weights.attn_k_w[layer]),
+                                 tensor(weights.attn_k_b[layer]));
+            llaisys::ops::linear(value_2d, normalized,
+                                 tensor(weights.attn_v_w[layer]),
+                                 tensor(weights.attn_v_b[layer]));
+
+            auto query = query_2d->view({batch_size, meta.nh, meta.dh});
+            auto key = key_2d->view({batch_size, meta.nkvh, meta.dh});
+            auto value = value_2d->view({batch_size, meta.nkvh, meta.dh});
+            auto rotated_query = create({batch_size, meta.nh, meta.dh});
+            auto rotated_key = create({batch_size, meta.nkvh, meta.dh});
+            llaisys::ops::rope(rotated_query, query, position_tensor, meta.theta);
+            llaisys::ops::rope(rotated_key, key, position_tensor, meta.theta);
+
+            auto attention = create({batch_size, meta.nh, meta.dh});
+            for (size_t i = 0; i < batch_size; ++i) {
+                auto &state = *states[i];
+                copy(state.key_cache[layer]->slice(0, state.cache_len,
+                                                   state.cache_len + 1),
+                     rotated_key->slice(0, i, i + 1));
+                copy(state.value_cache[layer]->slice(0, state.cache_len,
+                                                     state.cache_len + 1),
+                     value->slice(0, i, i + 1));
+                auto all_keys = state.key_cache[layer]->slice(
+                    0, 0, state.cache_len + 1);
+                auto all_values = state.value_cache[layer]->slice(
+                    0, 0, state.cache_len + 1);
+                llaisys::ops::self_attention(
+                    attention->slice(0, i, i + 1),
+                    rotated_query->slice(0, i, i + 1), all_keys, all_values,
+                    1.0f / std::sqrt(static_cast<float>(meta.dh)));
+            }
+
+            auto attention_2d = attention->view(
+                {batch_size, meta.nh * meta.dh});
+            auto attention_output = create({batch_size, meta.hs});
+            llaisys::ops::linear(attention_output, attention_2d,
+                                 tensor(weights.attn_o_w[layer]), nullptr);
+            hidden = create({batch_size, meta.hs});
+            llaisys::ops::add(hidden, residual, attention_output);
+
+            residual = hidden;
+            normalized = create({batch_size, meta.hs});
+            llaisys::ops::rms_norm(normalized, hidden,
+                                   tensor(weights.mlp_norm_w[layer]),
+                                   meta.epsilon);
+            auto gate = create({batch_size, meta.di});
+            auto up = create({batch_size, meta.di});
+            llaisys::ops::linear(gate, normalized,
+                                 tensor(weights.mlp_gate_w[layer]), nullptr);
+            llaisys::ops::linear(up, normalized,
+                                 tensor(weights.mlp_up_w[layer]), nullptr);
+            auto activated = create({batch_size, meta.di});
+            llaisys::ops::swiglu(activated, gate, up);
+            auto mlp_output = create({batch_size, meta.hs});
+            llaisys::ops::linear(mlp_output, activated,
+                                 tensor(weights.mlp_down_w[layer]), nullptr);
+            hidden = create({batch_size, meta.hs});
+            llaisys::ops::add(hidden, residual, mlp_output);
+        }
+
+        for (size_t i = 0; i < batch_size; ++i) {
+            ++states[i]->cache_len;
+            states[i]->token_history.push_back(token_ids[i]);
+        }
+        auto final_hidden = create({batch_size, meta.hs});
+        llaisys::ops::rms_norm(final_hidden, hidden, tensor(weights.out_norm_w),
+                               meta.epsilon);
+        auto logits = create({batch_size, meta.voc});
+        llaisys::ops::linear(logits, final_hidden, tensor(weights.out_embed),
+                             nullptr);
+        return logits;
+    }
+
+    void inferBatchGreedy(const std::vector<Qwen2SequenceState *> &states,
+                          const int64_t *token_ids, int64_t *output_ids) {
+        CHECK_ARGUMENT(output_ids != nullptr, "Qwen2 batch output must not be null");
+        auto logits = forwardBatch(states, token_ids);
+        for (size_t i = 0; i < states.size(); ++i) {
+            auto max_index = create({1}, LLAISYS_DTYPE_I64);
+            auto max_value = create({1});
+            llaisys::ops::argmax(max_index, max_value,
+                                 logits->slice(0, i, i + 1)->view({meta.voc}));
+            llaisys::core::context().setDevice(device, device_id);
+            llaisys::core::context().runtime().api()->memcpy_sync(
+                output_ids + i, max_index->data(), sizeof(int64_t),
+                device == LLAISYS_DEVICE_CPU ? LLAISYS_MEMCPY_H2H
+                                             : LLAISYS_MEMCPY_D2H);
+        }
     }
 
     std::vector<float> copyLogitsToHost(tensor_t logits) const {
@@ -271,7 +453,8 @@ struct LlaisysQwen2Model {
         return scores;
     }
 
-    int64_t sample(tensor_t logits, const LlaisysSamplingConfig &config) {
+    int64_t sample(Qwen2SequenceState &state, tensor_t logits,
+                   const LlaisysSamplingConfig &config) {
         CHECK_ARGUMENT(config.temperature > 0.0f, "Temperature must be positive");
         CHECK_ARGUMENT(config.top_p > 0.0f && config.top_p <= 1.0f,
                        "Top-p must be in (0, 1]");
@@ -285,7 +468,8 @@ struct LlaisysQwen2Model {
         }
 
         if (config.repetition_penalty != 1.0f) {
-            std::unordered_set<int64_t> seen(token_history.begin(), token_history.end());
+            std::unordered_set<int64_t> seen(state.token_history.begin(),
+                                             state.token_history.end());
             for (int64_t token : seen) {
                 if (token < 0 || static_cast<size_t>(token) >= scores.size()) {
                     continue;
@@ -327,21 +511,36 @@ struct LlaisysQwen2Model {
             }
         }
 
-        if (!sampling_rng_initialized || sampling_seed != config.seed) {
-            sampling_rng.seed(config.seed);
-            sampling_seed = config.seed;
-            sampling_rng_initialized = true;
+        if (!state.sampling_rng_initialized || state.sampling_seed != config.seed) {
+            state.sampling_rng.seed(config.seed);
+            state.sampling_seed = config.seed;
+            state.sampling_rng_initialized = true;
         }
         std::discrete_distribution<size_t> distribution(weights.begin(), weights.begin() + kept);
-        return static_cast<int64_t>(indices[distribution(sampling_rng)]);
+        return static_cast<int64_t>(indices[distribution(state.sampling_rng)]);
     }
 
-    int64_t inferSample(const int64_t *token_ids, size_t token_count,
+    void inferBatchSample(const std::vector<Qwen2SequenceState *> &states,
+                          const int64_t *token_ids,
+                          const LlaisysSamplingConfig *configs,
+                          int64_t *output_ids) {
+        CHECK_ARGUMENT(configs != nullptr && output_ids != nullptr,
+                       "Qwen2 batch sampling arguments must not be null");
+        auto logits = forwardBatch(states, token_ids);
+        for (size_t i = 0; i < states.size(); ++i) {
+            output_ids[i] = sample(
+                *states[i], logits->slice(0, i, i + 1)->view({meta.voc}),
+                configs[i]);
+        }
+    }
+
+    int64_t inferSample(Qwen2SequenceState &state, const int64_t *token_ids,
+                        size_t token_count,
                         const LlaisysSamplingConfig &config) {
         if (config.top_k == 1 && config.repetition_penalty == 1.0f) {
-            return inferGreedy(token_ids, token_count);
+            return inferGreedy(state, token_ids, token_count);
         }
-        return sample(forward(token_ids, token_count), config);
+        return sample(state, forward(state, token_ids, token_count), config);
     }
 };
 
@@ -370,17 +569,17 @@ __C {
     }
 
     void llaisysQwen2ModelReset(LlaisysQwen2Model *model) {
-        if (model != nullptr) {
-            model->cache_len = 0;
-            model->token_history.clear();
-            model->sampling_rng_initialized = false;
+        if (model != nullptr && model->legacy_sequence) {
+            model->legacy_sequence->cache_len = 0;
+            model->legacy_sequence->token_history.clear();
+            model->legacy_sequence->sampling_rng_initialized = false;
         }
     }
 
     int64_t llaisysQwen2ModelInfer(LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
         try {
             CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
-            return model->inferGreedy(token_ids, ntoken);
+            return model->inferGreedy(model->legacyState(), token_ids, ntoken);
         } catch (...) {
             // Token ids are non-negative, so -1 is an unambiguous failure value.
             return -1;
@@ -392,9 +591,102 @@ __C {
         try {
             CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
             CHECK_ARGUMENT(config != nullptr, "Sampling config must not be null");
-            return model->inferSample(token_ids, ntoken, *config);
+            return model->inferSample(model->legacyState(), token_ids, ntoken,
+                                      *config);
         } catch (...) {
             return -1;
+        }
+    }
+
+    int llaisysQwen2SequenceCreate(LlaisysQwen2Model *model,
+                                   uint64_t sequence_id, size_t capacity) {
+        try {
+            CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
+            model->createSequence(sequence_id, capacity);
+            return 1;
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    void llaisysQwen2SequenceDestroy(LlaisysQwen2Model *model,
+                                     uint64_t sequence_id) {
+        if (model != nullptr) {
+            model->destroySequence(sequence_id);
+        }
+    }
+
+    int llaisysQwen2SequenceReset(LlaisysQwen2Model *model,
+                                  uint64_t sequence_id) {
+        try {
+            CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
+            model->resetSequence(sequence_id);
+            return 1;
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    int64_t llaisysQwen2SequenceInfer(LlaisysQwen2Model *model,
+                                      uint64_t sequence_id,
+                                      int64_t *token_ids, size_t ntoken) {
+        try {
+            CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
+            return model->inferGreedy(model->sequence(sequence_id), token_ids,
+                                      ntoken);
+        } catch (...) {
+            return -1;
+        }
+    }
+
+    int64_t llaisysQwen2SequenceInferSample(
+        LlaisysQwen2Model *model, uint64_t sequence_id, int64_t *token_ids,
+        size_t ntoken, const LlaisysSamplingConfig *config) {
+        try {
+            CHECK_ARGUMENT(model != nullptr, "Qwen2 model must not be null");
+            CHECK_ARGUMENT(config != nullptr, "Sampling config must not be null");
+            return model->inferSample(model->sequence(sequence_id), token_ids,
+                                      ntoken, *config);
+        } catch (...) {
+            return -1;
+        }
+    }
+
+    int llaisysQwen2BatchInfer(LlaisysQwen2Model *model,
+                               const uint64_t *sequence_ids,
+                               const int64_t *token_ids, size_t batch_size,
+                               int64_t *output_ids) {
+        try {
+            CHECK_ARGUMENT(model != nullptr && sequence_ids != nullptr,
+                           "Qwen2 batch arguments must not be null");
+            std::vector<Qwen2SequenceState *> states;
+            states.reserve(batch_size);
+            for (size_t i = 0; i < batch_size; ++i) {
+                states.push_back(&model->sequence(sequence_ids[i]));
+            }
+            model->inferBatchGreedy(states, token_ids, output_ids);
+            return 1;
+        } catch (...) {
+            return 0;
+        }
+    }
+
+    int llaisysQwen2BatchInferSample(
+        LlaisysQwen2Model *model, const uint64_t *sequence_ids,
+        const int64_t *token_ids, size_t batch_size,
+        const LlaisysSamplingConfig *configs, int64_t *output_ids) {
+        try {
+            CHECK_ARGUMENT(model != nullptr && sequence_ids != nullptr,
+                           "Qwen2 batch arguments must not be null");
+            std::vector<Qwen2SequenceState *> states;
+            states.reserve(batch_size);
+            for (size_t i = 0; i < batch_size; ++i) {
+                states.push_back(&model->sequence(sequence_ids[i]));
+            }
+            model->inferBatchSample(states, token_ids, configs, output_ids);
+            return 1;
+        } catch (...) {
+            return 0;
         }
     }
 }
