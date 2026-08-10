@@ -108,6 +108,69 @@ class ServiceUnavailableError(RuntimeError):
     """Raised when the server is draining or no longer accepting work."""
 
 
+class KVCacheBudget:
+    """Thread-safe reservation accounting for per-sequence KV cache memory."""
+
+    def __init__(
+        self, max_bytes: Optional[int] = None, high_watermark: float = 0.9
+    ) -> None:
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or max_bytes <= 0
+        ):
+            raise ValueError("max_bytes must be a positive integer")
+        if not math.isfinite(high_watermark) or not 0.0 < high_watermark <= 1.0:
+            raise ValueError("high_watermark must be in (0, 1]")
+        self.max_bytes = max_bytes
+        self.high_watermark = float(high_watermark)
+        self._reservations: Dict[str, int] = {}
+        self._lock = threading.RLock()
+        self.rejections_total = 0
+
+    @property
+    def limit_bytes(self) -> Optional[int]:
+        if self.max_bytes is None:
+            return None
+        return int(self.max_bytes * self.high_watermark)
+
+    def reserve(self, request_id: str, size_bytes: int) -> None:
+        if size_bytes < 0:
+            raise ValueError("KV cache reservation must be non-negative")
+        with self._lock:
+            if request_id in self._reservations:
+                raise ValueError(f"KV cache is already reserved: {request_id}")
+            limit = self.limit_bytes
+            used = sum(self._reservations.values())
+            if limit is not None and used + size_bytes > limit:
+                self.rejections_total += 1
+                raise ServiceOverloadedError(
+                    "KV cache budget exceeded: "
+                    f"requested={size_bytes} available={max(0, limit - used)}"
+                )
+            self._reservations[request_id] = size_bytes
+
+    def release(self, request_id: str) -> int:
+        with self._lock:
+            return self._reservations.pop(request_id, 0)
+
+    def snapshot(self) -> Dict[str, int | float]:
+        with self._lock:
+            reserved = sum(self._reservations.values())
+            limit = self.limit_bytes
+            return {
+                "kv_cache_capacity_bytes": self.max_bytes or 0,
+                "kv_cache_limit_bytes": limit or 0,
+                "kv_cache_reserved_bytes": reserved,
+                "kv_cache_available_bytes": (
+                    max(0, limit - reserved) if limit is not None else 0
+                ),
+                "kv_cache_active_reservations": len(self._reservations),
+                "kv_cache_high_watermark": self.high_watermark,
+                "kv_cache_rejections_total": self.rejections_total,
+            }
+
+
 @dataclass
 class GenerationRequest:
     request_id: str
@@ -722,6 +785,8 @@ class RoundRobinScheduler(RequestScheduler):
         self._commit_partial_on_abort = commit_partial_on_abort
         self._eos_token_id = getattr(model, "eos_token_id", None)
         self.max_active_requests = max_active_requests
+        self.backend_errors_total = 0
+        self.backend_oom_total = 0
 
     def submit(
         self,
@@ -768,7 +833,15 @@ class RoundRobinScheduler(RequestScheduler):
                 repetition_penalty=repetition_penalty,
                 seed=seed,
             )
+            self._reserve_request_resources(request)
         except Exception:
+            try:
+                request = self.request_pool.get(request_id)
+            except KeyError:
+                request = None
+            if request is not None and request.status is RequestStatus.WAITING:
+                self.request_pool.cancel(request_id)
+                self.sessions.release(request.session_id)
             with self._events_lock:
                 del self._event_queues[request_id]
             raise
@@ -782,6 +855,7 @@ class RoundRobinScheduler(RequestScheduler):
                 return False
             request.finish_reason = FinishReason.CANCELLED
             self.sessions.release(request.session_id)
+            self._release_request_resources(request)
             self._publish(self._terminal_event(request))
             return True
         if request.status is RequestStatus.RUNNING:
@@ -993,6 +1067,20 @@ class RoundRobinScheduler(RequestScheduler):
             request.phase = RequestPhase.PREFILL
             self._active.append(request.request_id)
 
+    def _reserve_request_resources(self, request: GenerationRequest) -> None:
+        del request
+
+    def _release_request_resources(self, request: GenerationRequest) -> None:
+        del request
+
+    def resource_snapshot(self) -> Dict[str, int | float]:
+        return {
+            "request_queue_pending": self.request_pool.pending_count(),
+            "request_active_sequences": len(self._active),
+            "backend_errors_total": self.backend_errors_total,
+            "backend_oom_total": self.backend_oom_total,
+        }
+
     def _expire_waiting_requests(self) -> List[TokenEvent]:
         events = []
         now = time.time()
@@ -1012,6 +1100,7 @@ class RoundRobinScheduler(RequestScheduler):
                 request.phase = RequestPhase.FINISHED
                 request.error = f"{request.timeout_phase} timeout exceeded"
                 self.sessions.release(request.session_id)
+                self._release_request_resources(request)
                 event = self._terminal_event(request)
                 self._publish(event)
                 events.append(event)
@@ -1092,6 +1181,7 @@ class RoundRobinScheduler(RequestScheduler):
         )
         self.sessions.commit(request.session_id, request.output_tokens)
         self.sessions.release(request.session_id)
+        self._release_request_resources(request)
         request.finished_at = time.time()
         event = TokenEvent(
             request_id=request.request_id,
@@ -1118,6 +1208,7 @@ class RoundRobinScheduler(RequestScheduler):
             if self._commit_partial_on_abort:
                 self.sessions.commit(request.session_id, request.output_tokens)
         self.sessions.release(request.session_id)
+        self._release_request_resources(request)
         request.finished_at = time.time()
         event = self._terminal_event(request, text=text)
         self._publish(event)
@@ -1131,7 +1222,11 @@ class RoundRobinScheduler(RequestScheduler):
         request.phase = RequestPhase.FINISHED
         request.finish_reason = FinishReason.ERROR
         request.error = str(error)
+        self.backend_errors_total += 1
+        if "out of memory" in request.error.lower():
+            self.backend_oom_total += 1
         self.sessions.release(request.session_id)
+        self._release_request_resources(request)
         request.finished_at = time.time()
         event = self._terminal_event(request, text=text)
         self._publish(event)
@@ -1176,6 +1271,8 @@ class OrcaScheduler(RoundRobinScheduler):
         max_sequence_length: Optional[int] = None,
         max_active_requests: Optional[int] = 32,
         max_prefill_per_iteration: int = 1,
+        max_kv_cache_bytes: Optional[int] = None,
+        kv_cache_high_watermark: float = 0.9,
     ) -> None:
         if not getattr(model, "supports_sequence_batching", False):
             raise ValueError("OrcaScheduler requires a sequence-batched model")
@@ -1194,6 +1291,39 @@ class OrcaScheduler(RoundRobinScheduler):
         self.model: SequenceBatchModel = model
         self.max_prefill_per_iteration = max_prefill_per_iteration
         self.decode_batch_sizes: Deque[int] = deque(maxlen=10000)
+        self.kv_cache_budget = KVCacheBudget(
+            max_bytes=max_kv_cache_bytes,
+            high_watermark=kv_cache_high_watermark,
+        )
+
+    def _estimate_request_kv_bytes(self, request: GenerationRequest) -> int:
+        estimate = getattr(self.model, "estimate_kv_cache_bytes", None)
+        if estimate is None:
+            return 0
+        session = self.sessions.get(request.session_id)
+        prompt_tokens = len(session.token_history) + len(request.input_tokens)
+        if self.max_sequence_length is not None:
+            prompt_tokens = min(
+                prompt_tokens,
+                self.max_sequence_length - request.max_new_tokens,
+            )
+        return int(estimate(prompt_tokens + request.max_new_tokens))
+
+    def _reserve_request_resources(self, request: GenerationRequest) -> None:
+        self.kv_cache_budget.reserve(
+            request.request_id, self._estimate_request_kv_bytes(request)
+        )
+
+    def _release_request_resources(self, request: GenerationRequest) -> None:
+        self.kv_cache_budget.release(request.request_id)
+
+    def resource_snapshot(self) -> Dict[str, int | float]:
+        snapshot = super().resource_snapshot()
+        snapshot.update(self.kv_cache_budget.snapshot())
+        model_snapshot = getattr(self.model, "kv_cache_snapshot", None)
+        if model_snapshot is not None:
+            snapshot.update(model_snapshot())
+        return snapshot
 
     @staticmethod
     def _sampling_args(request: GenerationRequest) -> Dict[str, object]:

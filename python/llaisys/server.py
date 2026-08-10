@@ -17,7 +17,7 @@ import weakref
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .serving import (
@@ -38,7 +38,10 @@ from .serving import (
 class ServingMetrics:
     """Thread-safe counters and latency aggregates for the HTTP layer."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        resource_provider: Optional[Callable[[], Mapping[str, object]]] = None,
+    ) -> None:
         self._lock = threading.RLock()
         self._started_at = time.time()
         self.requests_total = 0
@@ -57,6 +60,7 @@ class ServingMetrics:
         self._ttft_samples: Deque[float] = deque(maxlen=10000)
         self._duration_samples: Deque[float] = deque(maxlen=10000)
         self._token_rate_samples: Deque[float] = deque(maxlen=10000)
+        self._resource_provider = resource_provider
 
     def submitted(self, request: GenerationRequest) -> None:
         with self._lock:
@@ -139,6 +143,8 @@ class ServingMetrics:
                     snapshot[f"{name}_{label}"] = self._percentile(
                         samples, quantile
                     )
+            if self._resource_provider is not None:
+                snapshot.update(self._resource_provider())
             return snapshot
 
     @staticmethod
@@ -166,7 +172,11 @@ class ServingMetrics:
             "generated_tokens_total",
         }
         for name, value in values.items():
-            metric_type = "counter" if name in counters else "gauge"
+            metric_type = (
+                "counter"
+                if name in counters or name.endswith("_total")
+                else "gauge"
+            )
             metric_name = f"llaisys_{name}"
             lines.extend(
                 [f"# TYPE {metric_name} {metric_type}", f"{metric_name} {value}"]
@@ -193,7 +203,9 @@ class OpenAIAPIServer:
         self.chat = chat
         self.scheduler: RoundRobinScheduler = chat.scheduler
         self.model_id = model_id
-        self.metrics = ServingMetrics()
+        self.metrics = ServingMetrics(
+            resource_provider=self.scheduler.resource_snapshot
+        )
         self._httpd = _Server((host, port), self._handler_type())
         self._thread: Optional[threading.Thread] = None
         self._lifecycle_lock = threading.RLock()
@@ -1037,7 +1049,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--scheduler", choices=("orca", "round-robin"), default="orca"
     )
     parser.add_argument("--max-prefill-per-iteration", type=int, default=1)
+    parser.add_argument(
+        "--max-kv-cache-mib",
+        type=int,
+        default=0,
+        help="KV cache reservation budget in MiB; 0 disables the limit",
+    )
+    parser.add_argument(
+        "--kv-cache-high-watermark", type=float, default=0.9
+    )
     args = parser.parse_args(argv)
+    if args.max_kv_cache_mib < 0:
+        parser.error("--max-kv-cache-mib must be non-negative")
+    if not 0.0 < args.kv_cache_high_watermark <= 1.0:
+        parser.error("--kv-cache-high-watermark must be in (0, 1]")
 
     # Imported lazily so importing llaisys.server does not require transformers.
     from transformers import AutoTokenizer
@@ -1057,6 +1082,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             request_pool=request_pool,
             max_active_requests=args.max_active_requests,
             max_prefill_per_iteration=args.max_prefill_per_iteration,
+            max_kv_cache_bytes=(
+                args.max_kv_cache_mib * 1024 * 1024
+                if args.max_kv_cache_mib > 0
+                else None
+            ),
+            kv_cache_high_watermark=args.kv_cache_high_watermark,
         )
     else:
         scheduler = RoundRobinScheduler(

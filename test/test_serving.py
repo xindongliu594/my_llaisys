@@ -66,6 +66,10 @@ class BatchedStepModel(StepModel):
         assert capacity > 0
         self.sequences.add(sequence_id)
 
+    @staticmethod
+    def estimate_kv_cache_bytes(capacity):
+        return int(capacity) * 100
+
     def destroy_sequence(self, sequence_id):
         self.sequences.discard(sequence_id)
 
@@ -95,6 +99,13 @@ class SlowBatchedStepModel(BatchedStepModel):
         return super().decode_batch(
             sequence_ids, token_ids, sampling_configs
         )
+
+
+class OOMPrefillBatchedModel(BatchedStepModel):
+    def prefill_sequence(self, sequence_id, input_tokens, **kwargs):
+        if int(input_tokens[0]) == 9:
+            raise RuntimeError("CUDA out of memory")
+        return super().prefill_sequence(sequence_id, input_tokens, **kwargs)
 
 
 class FakeTokenizer:
@@ -377,6 +388,58 @@ class RoundRobinServingTest(unittest.TestCase):
 
 
 class OrcaServingTest(unittest.TestCase):
+    def test_backend_oom_isolated_and_scheduler_keeps_running(self):
+        model = OOMPrefillBatchedModel()
+        scheduler = llaisys.OrcaScheduler(
+            model, max_prefill_per_iteration=2
+        )
+        scheduler.sessions.create("oom")
+        scheduler.sessions.create("healthy")
+        failed = scheduler.submit("oom", [9], max_new_tokens=2)
+        healthy = scheduler.submit("healthy", [1], max_new_tokens=2)
+        scheduler.step_batch()
+        self.assertEqual(failed.status, llaisys.RequestStatus.FAILED)
+        self.assertIn("out of memory", failed.error.lower())
+        self.assertEqual(healthy.status, llaisys.RequestStatus.RUNNING)
+        self.assertNotIn(failed.request_id, model.sequences)
+
+        scheduler.step_batch()
+        self.assertEqual(healthy.status, llaisys.RequestStatus.FINISHED)
+        snapshot = scheduler.resource_snapshot()
+        self.assertEqual(snapshot["backend_errors_total"], 1)
+        self.assertEqual(snapshot["backend_oom_total"], 1)
+        self.assertEqual(snapshot["kv_cache_reserved_bytes"], 0)
+
+    def test_kv_cache_budget_rejects_overcommit_and_releases(self):
+        model = BatchedStepModel()
+        scheduler = llaisys.OrcaScheduler(
+            model,
+            max_active_requests=1,
+            max_kv_cache_bytes=1000,
+            kv_cache_high_watermark=0.5,
+        )
+        scheduler.sessions.create("reserved")
+        scheduler.sessions.create("rejected")
+        reserved = scheduler.submit("reserved", [1], max_new_tokens=3)
+        snapshot = scheduler.resource_snapshot()
+        self.assertEqual(snapshot["kv_cache_reserved_bytes"], 400)
+        self.assertEqual(snapshot["kv_cache_available_bytes"], 100)
+
+        with self.assertRaisesRegex(
+            llaisys.ServiceOverloadedError, "KV cache budget exceeded"
+        ):
+            scheduler.submit("rejected", [2], max_new_tokens=1)
+        self.assertFalse(scheduler.sessions.get("rejected").busy)
+        self.assertEqual(
+            scheduler.resource_snapshot()["kv_cache_rejections_total"], 1
+        )
+
+        scheduler.cancel(reserved.request_id)
+        scheduler.step_batch()
+        snapshot = scheduler.resource_snapshot()
+        self.assertEqual(snapshot["kv_cache_reserved_bytes"], 0)
+        self.assertEqual(snapshot["kv_cache_active_reservations"], 0)
+
     def test_queue_prefill_and_decode_timeouts_release_sequences(self):
         queue_model = SlowBatchedStepModel()
         queue_scheduler = llaisys.OrcaScheduler(

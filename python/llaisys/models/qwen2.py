@@ -3,6 +3,7 @@ import json
 import mmap
 import re
 import struct
+import threading
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -32,6 +33,8 @@ class Qwen2:
     def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
         self._model = None
         self._sequence_ids = {}
+        self._sequence_capacities = {}
+        self._sequence_lock = threading.RLock()
         self._next_sequence_id = 1
         self._device = DeviceType(device)
         model_path = Path(model_path)
@@ -90,6 +93,39 @@ class Qwen2:
     @property
     def max_sequence_length(self) -> int:
         return int(self._meta.maxseq)
+
+    @property
+    def kv_cache_bytes_per_token(self) -> int:
+        element_size = {
+            int(DataType.F16): 2,
+            int(DataType.BF16): 2,
+            int(DataType.F32): 4,
+        }[int(self._meta.dtype)]
+        return (
+            2
+            * int(self._meta.nlayer)
+            * int(self._meta.nkvh)
+            * int(self._meta.dh)
+            * element_size
+        )
+
+    def estimate_kv_cache_bytes(self, capacity: int) -> int:
+        if not 0 <= capacity <= self.max_sequence_length:
+            raise ValueError("KV cache capacity is outside the model limit")
+        return int(capacity) * self.kv_cache_bytes_per_token
+
+    def kv_cache_snapshot(self) -> dict[str, int]:
+        with self._sequence_lock:
+            allocated_tokens = sum(self._sequence_capacities.values())
+            sequence_count = len(self._sequence_capacities)
+        return {
+            "kv_cache_allocated_bytes": (
+                allocated_tokens * self.kv_cache_bytes_per_token
+            ),
+            "kv_cache_allocated_tokens": allocated_tokens,
+            "kv_cache_model_sequences": sequence_count,
+            "kv_cache_bytes_per_token": self.kv_cache_bytes_per_token,
+        }
 
     def _weight_handle(self, weights, name: str):
         if name == "model.embed_tokens.weight":
@@ -223,23 +259,28 @@ class Qwen2:
 
     def create_sequence(self, sequence_id: str, capacity: int) -> None:
         key = str(sequence_id)
-        if key in self._sequence_ids:
-            raise ValueError(f"Sequence already exists: {key}")
-        if not 0 < capacity <= self.max_sequence_length:
-            raise ValueError("Sequence capacity is outside the model limit")
-        numeric_id = self._next_sequence_id
-        self._next_sequence_id += 1
-        created = LIB_LLAISYS.llaisysQwen2SequenceCreate(
-            self._model, numeric_id, capacity
-        )
-        if not created:
-            raise RuntimeError("Failed to allocate sequence KV cache")
-        self._sequence_ids[key] = numeric_id
+        with self._sequence_lock:
+            if key in self._sequence_ids:
+                raise ValueError(f"Sequence already exists: {key}")
+            if not 0 < capacity <= self.max_sequence_length:
+                raise ValueError("Sequence capacity is outside the model limit")
+            numeric_id = self._next_sequence_id
+            self._next_sequence_id += 1
+            created = LIB_LLAISYS.llaisysQwen2SequenceCreate(
+                self._model, numeric_id, capacity
+            )
+            if not created:
+                raise RuntimeError("Failed to allocate sequence KV cache")
+            self._sequence_ids[key] = numeric_id
+            self._sequence_capacities[key] = int(capacity)
 
     def destroy_sequence(self, sequence_id: str) -> None:
-        numeric_id = self._sequence_ids.pop(str(sequence_id), None)
-        if numeric_id is not None:
-            LIB_LLAISYS.llaisysQwen2SequenceDestroy(self._model, numeric_id)
+        key = str(sequence_id)
+        with self._sequence_lock:
+            numeric_id = self._sequence_ids.pop(key, None)
+            self._sequence_capacities.pop(key, None)
+            if numeric_id is not None:
+                LIB_LLAISYS.llaisysQwen2SequenceDestroy(self._model, numeric_id)
 
     @staticmethod
     def _sampling_config(
@@ -267,7 +308,8 @@ class Qwen2:
         repetition_penalty: float = 1.0,
         seed: int = 0,
     ) -> int:
-        numeric_id = self._sequence_ids[str(sequence_id)]
+        with self._sequence_lock:
+            numeric_id = self._sequence_ids[str(sequence_id)]
         tokens = [int(token) for token in input_tokens]
         if not tokens:
             raise ValueError("Prefill requires at least one token")
@@ -303,7 +345,10 @@ class Qwen2:
             len(sequence_ids) == len(token_ids) == len(sampling_configs)
         ):
             raise ValueError("Batch sequence, token, and config lengths must match")
-        numeric_ids = [self._sequence_ids[str(key)] for key in sequence_ids]
+        with self._sequence_lock:
+            numeric_ids = [
+                self._sequence_ids[str(key)] for key in sequence_ids
+            ]
         batch_size = len(numeric_ids)
         id_array = (ctypes.c_uint64 * batch_size)(*numeric_ids)
         token_array = (ctypes.c_int64 * batch_size)(

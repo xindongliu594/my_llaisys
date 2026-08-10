@@ -103,6 +103,8 @@ class HTTPServerTest(unittest.TestCase):
         self.assertIn("llaisys_ttft_seconds_p95", metrics)
         self.assertIn("llaisys_ttft_seconds_p99", metrics)
         self.assertIn("llaisys_generated_tokens_per_second", metrics)
+        self.assertIn("llaisys_request_queue_pending", metrics)
+        self.assertIn("llaisys_request_active_sequences", metrics)
 
     def test_context_stop_strings_and_strict_validation(self):
         status, _, body = self.request(
