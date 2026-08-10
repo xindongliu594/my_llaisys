@@ -16,7 +16,7 @@ import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .serving import (
     ChatMessage,
@@ -184,7 +184,8 @@ class OpenAIAPIServer:
 
     def _handle_get(self, handler: BaseHTTPRequestHandler) -> None:
         try:
-            path = urlparse(handler.path).path
+            parsed = urlparse(handler.path)
+            path = parsed.path
             if path == "/health":
                 self._json(handler, HTTPStatus.OK, {"status": "ok"})
                 return
@@ -219,6 +220,48 @@ class OpenAIAPIServer:
                 ]
                 self._json(handler, HTTPStatus.OK, {"data": sessions})
                 return
+            if path == "/requests":
+                query = parse_qs(parsed.query)
+                status_filter = query.get("status", [None])[0]
+                session_filter = query.get("session_id", [None])[0]
+                if status_filter is not None:
+                    try:
+                        status = RequestStatus(status_filter)
+                    except ValueError as error:
+                        raise ValueError(
+                            f"Unknown request status: {status_filter}"
+                        ) from error
+                else:
+                    status = None
+                raw_limit = query.get("limit", ["100"])[0]
+                try:
+                    limit = int(raw_limit)
+                except ValueError as error:
+                    raise ValueError("limit must be an integer") from error
+                if not 1 <= limit <= 1000:
+                    raise ValueError("limit must be between 1 and 1000")
+                requests = sorted(
+                    self.scheduler.request_pool.requests(),
+                    key=lambda request: request.created_at,
+                    reverse=True,
+                )
+                if status is not None:
+                    requests = [
+                        request for request in requests if request.status is status
+                    ]
+                if session_filter is not None:
+                    requests = [
+                        request
+                        for request in requests
+                        if request.session_id == session_filter
+                    ]
+                data = [self._request_json(request) for request in requests[:limit]]
+                self._json(
+                    handler,
+                    HTTPStatus.OK,
+                    {"object": "list", "count": len(data), "data": data},
+                )
+                return
             if path.startswith("/sessions/"):
                 session_id = unquote(path.removeprefix("/sessions/"))
                 self._json(
@@ -245,6 +288,22 @@ class OpenAIAPIServer:
                 return
             if path == "/v1/completions":
                 self._text_completion(handler, body)
+                return
+            if path == "/sessions/import":
+                raw_session = body.get("session", body)
+                if not isinstance(raw_session, Mapping):
+                    raise ValueError("session must be an object")
+                new_session_id = self._optional_string(body, "new_session_id")
+                if new_session_id == "":
+                    raise ValueError("new_session_id must not be empty")
+                session = self.chat.import_session(
+                    raw_session, session_id=new_session_id
+                )
+                self._json(
+                    handler,
+                    HTTPStatus.CREATED,
+                    self.chat.export_session(session.session_id),
+                )
                 return
             if path == "/sessions":
                 session_id = self._optional_string(body, "session_id")
@@ -680,8 +739,30 @@ class OpenAIAPIServer:
             return "stop"
         return reason.value if reason is not None else None
 
-    @staticmethod
-    def _request_json(request: GenerationRequest) -> Dict[str, object]:
+    @classmethod
+    def _request_json(cls, request: GenerationRequest) -> Dict[str, object]:
+        now = time.time()
+        queue_seconds = (
+            request.started_at - request.created_at
+            if request.started_at is not None
+            else None
+        )
+        ttft_seconds = (
+            request.first_token_at - request.created_at
+            if request.first_token_at is not None
+            else None
+        )
+        total_seconds = (
+            request.finished_at - request.created_at
+            if request.finished_at is not None
+            else None
+        )
+        generation_seconds = (
+            request.finished_at - request.first_token_at
+            if request.finished_at is not None
+            and request.first_token_at is not None
+            else None
+        )
         return {
             "request_id": request.request_id,
             "session_id": request.session_id,
@@ -690,6 +771,15 @@ class OpenAIAPIServer:
                 request.finish_reason.value if request.finish_reason else None
             ),
             "generated_tokens": list(request.generated_tokens),
+            "output_text": request.streamed_text,
+            "usage": cls._usage(request),
+            "timing": {
+                "queue_seconds": queue_seconds,
+                "ttft_seconds": ttft_seconds,
+                "generation_seconds": generation_seconds,
+                "total_seconds": total_seconds,
+                "elapsed_seconds": now - request.created_at,
+            },
             "error": request.error,
             "created_at": request.created_at,
             "started_at": request.started_at,
@@ -757,7 +847,9 @@ class OpenAIAPIServer:
     def _exception(
         self, handler: BaseHTTPRequestHandler, error: Exception
     ) -> None:
-        if isinstance(error, (KeyError, ValueError, TypeError)):
+        if isinstance(error, KeyError):
+            status = HTTPStatus.NOT_FOUND
+        elif isinstance(error, (ValueError, TypeError)):
             status = HTTPStatus.BAD_REQUEST
         else:
             status = HTTPStatus.INTERNAL_SERVER_ERROR

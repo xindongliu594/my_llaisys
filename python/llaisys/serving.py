@@ -94,6 +94,7 @@ class GenerationRequest:
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
+    first_token_at: Optional[float] = None
     finished_at: Optional[float] = None
 
     @property
@@ -554,6 +555,8 @@ class RequestScheduler:
                         "The model must return the input context followed by generated tokens"
                     )
                 request.output_tokens = output
+                if len(output) > len(context):
+                    request.first_token_at = time.time()
                 request.status = RequestStatus.FINISHED
                 self.sessions.commit(request.session_id, output)
             except Exception as error:
@@ -705,6 +708,8 @@ class RoundRobinScheduler(RequestScheduler):
                         return self._finalize_abort(request, FinishReason.TIMEOUT)
 
                     request.generated_token_ids.append(token_id)
+                    if request.first_token_at is None:
+                        request.first_token_at = time.time()
                     reason = self._finish_reason(request, token_id)
                     text, stopped_by_string = self._decode_increment(
                         request, force_flush=reason is not None
@@ -1104,21 +1109,25 @@ class ChatService:
         for item in raw_messages:
             if not isinstance(item, Mapping):
                 raise TypeError("Each message must be a mapping")
-            messages.append(
-                ChatMessage(role=str(item["role"]), content=str(item["content"]))
-            )
+            role = item.get("role")
+            content = item.get("content")
+            if not isinstance(role, str) or not isinstance(content, str):
+                raise TypeError("message role and content must be strings")
+            messages.append(ChatMessage(role=role, content=content))
         metadata = data.get("metadata", {})
         if not isinstance(metadata, Mapping):
             raise TypeError("metadata must be a mapping")
         imported_session_id = session_id or data.get("session_id")
         imported_user_id = data.get("user_id")
+        if imported_session_id is not None and not isinstance(
+            imported_session_id, str
+        ):
+            raise TypeError("session_id must be a string")
+        if imported_user_id is not None and not isinstance(imported_user_id, str):
+            raise TypeError("user_id must be a string")
         return self.scheduler.sessions.create(
-            session_id=(
-                str(imported_session_id)
-                if imported_session_id is not None
-                else None
-            ),
-            user_id=(str(imported_user_id) if imported_user_id is not None else None),
+            session_id=imported_session_id,
+            user_id=imported_user_id,
             initial_messages=messages,
             metadata=metadata,
         )

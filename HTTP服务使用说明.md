@@ -148,3 +148,33 @@ Paged KV Cache，并让一次 C++ Decode 同时接收多个 sequence。
 
 生成参数执行严格类型和范围检查，包括模型名称、`max_tokens`、`top_k`、`top_p`、
 `temperature`、`repetition_penalty`、`seed`、`stream`、超时时间及消息字段。
+
+## 8. 请求结果、列表和会话导入
+
+单个请求结果会返回生成文本、Token 用量以及排队、TTFT、生成和总时延：
+
+```bash
+curl http://127.0.0.1:8000/requests/REQUEST_ID
+```
+
+请求列表支持按状态和会话筛选，`limit` 范围为 1～1000：
+
+```bash
+curl "http://127.0.0.1:8000/requests?status=finished&session_id=study-chat&limit=100"
+```
+
+`GET /sessions/{session_id}` 返回的数据可以原样导入，也可以指定新的会话 ID：
+
+```bash
+curl http://127.0.0.1:8000/sessions/import \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session": {
+      "session_id": "study-chat",
+      "user_id": "user-1",
+      "messages": [{"role": "user", "content": "什么是 GQA？"}],
+      "metadata": {}
+    },
+    "new_session_id": "study-chat-copy"
+  }'
+```

@@ -237,12 +237,40 @@ class HTTPServerTest(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(messages[-1], {"role": "assistant", "content": "A"})
 
+        _, _, result_body = self.request("GET", f"/requests/{request_id}")
+        request_result = json.loads(result_body)
+        self.assertEqual(request_result["output_text"], "A")
+        self.assertEqual(request_result["usage"]["completion_tokens"], 1)
+        self.assertIsNotNone(request_result["timing"]["ttft_seconds"])
+        self.assertIsNotNone(request_result["timing"]["total_seconds"])
+
+        _, _, list_body = self.request(
+            "GET", "/requests?status=finished&session_id=http-session&limit=10"
+        )
+        listed = json.loads(list_body)
+        self.assertGreaterEqual(listed["count"], 1)
+        self.assertEqual(listed["data"][0]["request_id"], request_id)
+
+        _, _, exported_body = self.request("GET", "/sessions/http-session")
+        exported = json.loads(exported_body)
+        status, _, imported_body = self.request(
+            "POST",
+            "/sessions/import",
+            {"session": exported, "new_session_id": "http-session-copy"},
+        )
+        self.assertEqual(status, 201)
+        imported = json.loads(imported_body)
+        self.assertEqual(imported["session_id"], "http-session-copy")
+        self.assertEqual(imported["messages"], exported["messages"])
+
         _, _, metrics_body = self.request("GET", "/metrics")
         self.assertIn("llaisys_requests_active 0", metrics_body.decode("utf-8"))
 
         status, _, body = self.request("DELETE", "/sessions/http-session")
         self.assertEqual(status, 200)
         self.assertTrue(json.loads(body)["deleted"])
+        status, _, _ = self.request("DELETE", "/sessions/http-session-copy")
+        self.assertEqual(status, 200)
 
 
 if __name__ == "__main__":
