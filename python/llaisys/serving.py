@@ -84,6 +84,13 @@ class RequestStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class RequestPhase(str, Enum):
+    WAITING = "waiting"
+    PREFILL = "prefill"
+    DECODE = "decode"
+    FINISHED = "finished"
+
+
 class FinishReason(str, Enum):
     EOS = "eos"
     STOP = "stop"
@@ -117,8 +124,13 @@ class GenerationRequest:
     stop_strings: Tuple[str, ...] = ()
     truncate_prompt: bool = False
     timeout_seconds: Optional[float] = None
+    queue_timeout_seconds: Optional[float] = None
+    prefill_timeout_seconds: Optional[float] = None
+    decode_timeout_seconds: Optional[float] = None
     status: RequestStatus = RequestStatus.WAITING
+    phase: RequestPhase = RequestPhase.WAITING
     finish_reason: Optional[FinishReason] = None
+    timeout_phase: Optional[str] = None
     cancel_requested: bool = False
     context_length: Optional[int] = None
     context_tokens: Optional[Tuple[int, ...]] = None
@@ -128,6 +140,9 @@ class GenerationRequest:
     error: Optional[str] = None
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
+    prefill_started_at: Optional[float] = None
+    prefill_finished_at: Optional[float] = None
+    decode_started_at: Optional[float] = None
     first_token_at: Optional[float] = None
     finished_at: Optional[float] = None
 
@@ -144,6 +159,27 @@ class GenerationRequest:
         if self.timeout_seconds is None:
             return None
         return self.created_at + self.timeout_seconds
+
+    @property
+    def queue_deadline(self) -> Optional[float]:
+        if self.queue_timeout_seconds is None:
+            return None
+        return self.created_at + self.queue_timeout_seconds
+
+    @property
+    def prefill_deadline(self) -> Optional[float]:
+        if (
+            self.prefill_timeout_seconds is None
+            or self.prefill_started_at is None
+        ):
+            return None
+        return self.prefill_started_at + self.prefill_timeout_seconds
+
+    @property
+    def decode_deadline(self) -> Optional[float]:
+        if self.decode_timeout_seconds is None or self.decode_started_at is None:
+            return None
+        return self.decode_started_at + self.decode_timeout_seconds
 
 
 @dataclass(frozen=True)
@@ -438,6 +474,9 @@ class RequestScheduler:
         stop_strings: Sequence[str] = (),
         truncate_prompt: bool = False,
         timeout_seconds: Optional[float] = None,
+        queue_timeout_seconds: Optional[float] = None,
+        prefill_timeout_seconds: Optional[float] = None,
+        decode_timeout_seconds: Optional[float] = None,
         top_k: int = 1,
         top_p: float = 0.8,
         temperature: float = 0.8,
@@ -450,13 +489,22 @@ class RequestScheduler:
             raise ValueError("max_new_tokens must be positive")
         if isinstance(priority, bool) or not isinstance(priority, int):
             raise ValueError("priority must be an integer")
-        if timeout_seconds is not None:
-            if isinstance(timeout_seconds, bool) or not isinstance(
-                timeout_seconds, (int, float)
+        for timeout_name, timeout_value in (
+            ("timeout_seconds", timeout_seconds),
+            ("queue_timeout_seconds", queue_timeout_seconds),
+            ("prefill_timeout_seconds", prefill_timeout_seconds),
+            ("decode_timeout_seconds", decode_timeout_seconds),
+        ):
+            if timeout_value is None:
+                continue
+            if isinstance(timeout_value, bool) or not isinstance(
+                timeout_value, (int, float)
             ):
-                raise ValueError("timeout_seconds must be a number")
-            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-                raise ValueError("timeout_seconds must be positive and finite")
+                raise ValueError(f"{timeout_name} must be a number")
+            if not math.isfinite(timeout_value) or timeout_value <= 0:
+                raise ValueError(
+                    f"{timeout_name} must be positive and finite"
+                )
         if isinstance(top_k, bool) or not isinstance(top_k, int):
             raise ValueError("top_k must be an integer")
         if top_k < 0:
@@ -531,6 +579,9 @@ class RequestScheduler:
             stop_strings=normalized_stops,
             truncate_prompt=truncate_prompt,
             timeout_seconds=timeout_seconds,
+            queue_timeout_seconds=queue_timeout_seconds,
+            prefill_timeout_seconds=prefill_timeout_seconds,
+            decode_timeout_seconds=decode_timeout_seconds,
         )
         try:
             self.request_pool.submit(request)
@@ -683,6 +734,9 @@ class RoundRobinScheduler(RequestScheduler):
         stop_strings: Sequence[str] = (),
         truncate_prompt: bool = False,
         timeout_seconds: Optional[float] = None,
+        queue_timeout_seconds: Optional[float] = None,
+        prefill_timeout_seconds: Optional[float] = None,
+        decode_timeout_seconds: Optional[float] = None,
         top_k: int = 1,
         top_p: float = 0.8,
         temperature: float = 0.8,
@@ -705,6 +759,9 @@ class RoundRobinScheduler(RequestScheduler):
                 stop_strings=stop_strings,
                 truncate_prompt=truncate_prompt,
                 timeout_seconds=timeout_seconds,
+                queue_timeout_seconds=queue_timeout_seconds,
+                prefill_timeout_seconds=prefill_timeout_seconds,
+                decode_timeout_seconds=decode_timeout_seconds,
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,
@@ -737,6 +794,9 @@ class RoundRobinScheduler(RequestScheduler):
         """Advances one active request by at most one generated token."""
 
         with self._worker_lock:
+            expired = self._expire_waiting_requests()
+            if expired:
+                return expired[0]
             self._admit_waiting()
             while self._active:
                 request = self.request_pool.get(self._active.popleft())
@@ -745,8 +805,8 @@ class RoundRobinScheduler(RequestScheduler):
 
                 if request.cancel_requested:
                     return self._finalize_abort(request, FinishReason.CANCELLED)
-                if request.deadline is not None and time.time() >= request.deadline:
-                    return self._finalize_abort(request, FinishReason.TIMEOUT)
+                if timeout_phase := self._expired_timeout_phase(request):
+                    return self._finalize_timeout(request, timeout_phase)
 
                 try:
                     if request.context_tokens is None:
@@ -754,13 +814,27 @@ class RoundRobinScheduler(RequestScheduler):
                         request.context_tokens = context
                         request.context_length = len(context)
 
+                    is_prefill = not request.generated_token_ids
+                    if is_prefill:
+                        request.phase = RequestPhase.PREFILL
+                        request.prefill_started_at = (
+                            request.prefill_started_at or time.time()
+                        )
+                    else:
+                        request.phase = RequestPhase.DECODE
+                        request.decode_started_at = (
+                            request.decode_started_at or time.time()
+                        )
+
                     token_id = self._generate_one(request)
                     if request.cancel_requested:
                         return self._finalize_abort(
                             request, FinishReason.CANCELLED
                         )
-                    if request.deadline is not None and time.time() >= request.deadline:
-                        return self._finalize_abort(request, FinishReason.TIMEOUT)
+                    if is_prefill:
+                        request.prefill_finished_at = time.time()
+                    if timeout_phase := self._expired_timeout_phase(request):
+                        return self._finalize_timeout(request, timeout_phase)
 
                     request.generated_token_ids.append(token_id)
                     if request.first_token_at is None:
@@ -916,7 +990,61 @@ class RoundRobinScheduler(RequestScheduler):
             request = self.request_pool.pop_next()
             if request is None:
                 return
+            request.phase = RequestPhase.PREFILL
             self._active.append(request.request_id)
+
+    def _expire_waiting_requests(self) -> List[TokenEvent]:
+        events = []
+        now = time.time()
+        for request in self.request_pool.requests():
+            if request.status is not RequestStatus.WAITING:
+                continue
+            total_expired = request.deadline is not None and now >= request.deadline
+            queue_expired = (
+                request.queue_deadline is not None
+                and now >= request.queue_deadline
+            )
+            if not total_expired and not queue_expired:
+                continue
+            if self.request_pool.cancel(request.request_id):
+                request.finish_reason = FinishReason.TIMEOUT
+                request.timeout_phase = "total" if total_expired else "queue"
+                request.phase = RequestPhase.FINISHED
+                request.error = f"{request.timeout_phase} timeout exceeded"
+                self.sessions.release(request.session_id)
+                event = self._terminal_event(request)
+                self._publish(event)
+                events.append(event)
+                break
+        return events
+
+    @staticmethod
+    def _expired_timeout_phase(
+        request: GenerationRequest, now: Optional[float] = None
+    ) -> Optional[str]:
+        now = time.time() if now is None else now
+        if request.deadline is not None and now >= request.deadline:
+            return "total"
+        if (
+            request.phase is RequestPhase.PREFILL
+            and request.prefill_deadline is not None
+            and now >= request.prefill_deadline
+        ):
+            return "prefill"
+        if (
+            request.phase is RequestPhase.DECODE
+            and request.decode_deadline is not None
+            and now >= request.decode_deadline
+        ):
+            return "decode"
+        return None
+
+    def _finalize_timeout(
+        self, request: GenerationRequest, timeout_phase: str
+    ) -> TokenEvent:
+        request.timeout_phase = timeout_phase
+        request.error = f"{timeout_phase} timeout exceeded"
+        return self._finalize_abort(request, FinishReason.TIMEOUT)
 
     def _generate_one(self, request: GenerationRequest) -> int:
         inputs = request.context_tokens + tuple(request.generated_token_ids)
@@ -957,6 +1085,7 @@ class RoundRobinScheduler(RequestScheduler):
         text: Optional[str] = None,
     ) -> TokenEvent:
         request.status = RequestStatus.FINISHED
+        request.phase = RequestPhase.FINISHED
         request.finish_reason = reason
         request.output_tokens = request.context_tokens + tuple(
             request.generated_token_ids
@@ -980,6 +1109,7 @@ class RoundRobinScheduler(RequestScheduler):
     ) -> TokenEvent:
         text, _ = self._decode_increment(request, force_flush=True)
         request.status = RequestStatus.CANCELLED
+        request.phase = RequestPhase.FINISHED
         request.finish_reason = reason
         if request.context_tokens is not None:
             request.output_tokens = request.context_tokens + tuple(
@@ -998,6 +1128,7 @@ class RoundRobinScheduler(RequestScheduler):
     ) -> TokenEvent:
         text, _ = self._decode_increment(request, force_flush=True)
         request.status = RequestStatus.FAILED
+        request.phase = RequestPhase.FINISHED
         request.finish_reason = FinishReason.ERROR
         request.error = str(error)
         self.sessions.release(request.session_id)
@@ -1103,13 +1234,13 @@ class OrcaScheduler(RoundRobinScheduler):
         """Runs one Orca iteration and returns every event from that iteration."""
 
         with self._worker_lock:
+            events: List[TokenEvent] = self._expire_waiting_requests()
             self._admit_waiting()
             active_ids = list(self._active)
             self._active.clear()
             if not active_ids:
-                return []
+                return events
 
-            events: List[TokenEvent] = []
             survivors: List[str] = []
             decode_requests: List[GenerationRequest] = []
             prefills = 0
@@ -1123,10 +1254,8 @@ class OrcaScheduler(RoundRobinScheduler):
                         self._finalize_abort(request, FinishReason.CANCELLED)
                     )
                     continue
-                if request.deadline is not None and time.time() >= request.deadline:
-                    events.append(
-                        self._finalize_abort(request, FinishReason.TIMEOUT)
-                    )
+                if timeout_phase := self._expired_timeout_phase(request):
+                    events.append(self._finalize_timeout(request, timeout_phase))
                     continue
                 if request.context_tokens is not None:
                     decode_requests.append(request)
@@ -1137,6 +1266,10 @@ class OrcaScheduler(RoundRobinScheduler):
 
                 prefills += 1
                 try:
+                    request.phase = RequestPhase.PREFILL
+                    request.prefill_started_at = (
+                        request.prefill_started_at or time.time()
+                    )
                     context = self._build_context(request)
                     request.context_tokens = context
                     request.context_length = len(context)
@@ -1149,17 +1282,13 @@ class OrcaScheduler(RoundRobinScheduler):
                         context,
                         **self._sampling_args(request),
                     )
+                    request.prefill_finished_at = time.time()
                     if request.cancel_requested:
                         event = self._finalize_abort(
                             request, FinishReason.CANCELLED
                         )
-                    elif (
-                        request.deadline is not None
-                        and time.time() >= request.deadline
-                    ):
-                        event = self._finalize_abort(
-                            request, FinishReason.TIMEOUT
-                        )
+                    elif timeout_phase := self._expired_timeout_phase(request):
+                        event = self._finalize_timeout(request, timeout_phase)
                     else:
                         event = self._accept_generated_token(request, token_id)
                 except Exception as error:
@@ -1167,6 +1296,21 @@ class OrcaScheduler(RoundRobinScheduler):
                 events.append(event)
                 if request.status is RequestStatus.RUNNING:
                     survivors.append(request.request_id)
+
+            if decode_requests:
+                ready_decode_requests = []
+                for request in decode_requests:
+                    request.phase = RequestPhase.DECODE
+                    request.decode_started_at = (
+                        request.decode_started_at or time.time()
+                    )
+                    if timeout_phase := self._expired_timeout_phase(request):
+                        events.append(
+                            self._finalize_timeout(request, timeout_phase)
+                        )
+                    else:
+                        ready_decode_requests.append(request)
+                decode_requests = ready_decode_requests
 
             if decode_requests:
                 self.decode_batch_sizes.append(len(decode_requests))
@@ -1183,12 +1327,9 @@ class OrcaScheduler(RoundRobinScheduler):
                             event = self._finalize_abort(
                                 request, FinishReason.CANCELLED
                             )
-                        elif (
-                            request.deadline is not None
-                            and time.time() >= request.deadline
-                        ):
-                            event = self._finalize_abort(
-                                request, FinishReason.TIMEOUT
+                        elif timeout_phase := self._expired_timeout_phase(request):
+                            event = self._finalize_timeout(
+                                request, timeout_phase
                             )
                         else:
                             event = self._accept_generated_token(
@@ -1311,6 +1452,9 @@ class ChatService:
         stop_strings: Sequence[str] = (),
         truncate_prompt: bool = False,
         timeout_seconds: Optional[float] = None,
+        queue_timeout_seconds: Optional[float] = None,
+        prefill_timeout_seconds: Optional[float] = None,
+        decode_timeout_seconds: Optional[float] = None,
         top_k: int = 1,
         top_p: float = 0.8,
         temperature: float = 0.8,
@@ -1341,6 +1485,9 @@ class ChatService:
                 stop_strings=stop_strings,
                 truncate_prompt=truncate_prompt,
                 timeout_seconds=timeout_seconds,
+                queue_timeout_seconds=queue_timeout_seconds,
+                prefill_timeout_seconds=prefill_timeout_seconds,
+                decode_timeout_seconds=decode_timeout_seconds,
                 top_k=top_k,
                 top_p=top_p,
                 temperature=temperature,

@@ -636,10 +636,8 @@ class OpenAIAPIServer:
                 }
                 self._sse(handler, chunk)
             self._sse_done(handler)
-        except (BrokenPipeError, ConnectionResetError):
-            self.scheduler.cancel(request.request_id)
-            for event in self.chat.events(request.request_id, timeout=None):
-                self.metrics.observed(request, event)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self._cancel_disconnected_request(request, chat=True)
 
     def _stream_text(
         self, handler: BaseHTTPRequestHandler, request: GenerationRequest
@@ -668,10 +666,23 @@ class OpenAIAPIServer:
                     },
                 )
             self._sse_done(handler)
-        except (BrokenPipeError, ConnectionResetError):
-            self.scheduler.cancel(request.request_id)
-            for event in self.scheduler.events(request.request_id, timeout=None):
-                self.metrics.observed(request, event)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self._cancel_disconnected_request(request, chat=False)
+
+    def _cancel_disconnected_request(
+        self, request: GenerationRequest, chat: bool
+    ) -> None:
+        """Cancels work only when it is still live, then drains its terminal event."""
+
+        if not self.scheduler.cancel(request.request_id):
+            return
+        events = (
+            self.chat.events(request.request_id, timeout=None)
+            if chat
+            else self.scheduler.events(request.request_id, timeout=None)
+        )
+        for event in events:
+            self.metrics.observed(request, event)
 
     def _observe_in_background(self, request: GenerationRequest) -> None:
         """Finalizes an asynchronous chat turn and records its metrics."""
@@ -748,6 +759,18 @@ class OpenAIAPIServer:
             timeout = OpenAIAPIServer._number(
                 body, "timeout_seconds", 0.0, minimum=0.0, strict_minimum=True
             )
+        phase_timeouts = {}
+        for name in (
+            "queue_timeout_seconds",
+            "prefill_timeout_seconds",
+            "decode_timeout_seconds",
+        ):
+            value = body.get(name)
+            if value is not None:
+                value = OpenAIAPIServer._number(
+                    body, name, 0.0, minimum=0.0, strict_minimum=True
+                )
+            phase_timeouts[name] = value
         truncate_prompt = body.get("truncate_prompt", False)
         if not isinstance(truncate_prompt, bool):
             raise ValueError("truncate_prompt must be a boolean")
@@ -758,6 +781,7 @@ class OpenAIAPIServer:
             "stop_strings": stop_strings,
             "truncate_prompt": truncate_prompt,
             "timeout_seconds": timeout,
+            **phase_timeouts,
             "top_k": top_k,
             "top_p": OpenAIAPIServer._number(
                 body, "top_p", 0.8, minimum=0.0, maximum=1.0,
@@ -881,14 +905,28 @@ class OpenAIAPIServer:
             "request_id": request.request_id,
             "session_id": request.session_id,
             "status": request.status.value,
+            "phase": request.phase.value,
             "finish_reason": (
                 request.finish_reason.value if request.finish_reason else None
             ),
+            "timeout_phase": request.timeout_phase,
             "generated_tokens": list(request.generated_tokens),
             "output_text": request.streamed_text,
             "usage": cls._usage(request),
             "timing": {
                 "queue_seconds": queue_seconds,
+                "prefill_seconds": (
+                    request.prefill_finished_at - request.prefill_started_at
+                    if request.prefill_finished_at is not None
+                    and request.prefill_started_at is not None
+                    else None
+                ),
+                "decode_seconds": (
+                    request.finished_at - request.decode_started_at
+                    if request.finished_at is not None
+                    and request.decode_started_at is not None
+                    else None
+                ),
                 "ttft_seconds": ttft_seconds,
                 "generation_seconds": generation_seconds,
                 "total_seconds": total_seconds,

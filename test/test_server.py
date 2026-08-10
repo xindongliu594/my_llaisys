@@ -140,6 +140,11 @@ class HTTPServerTest(unittest.TestCase):
                 "messages": [{"role": "user", "content": "Hello"}],
                 "stream": "false",
             },
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "queue_timeout_seconds": 0,
+            },
         ]
         for invalid in invalid_bodies:
             with self.subTest(invalid=invalid):
@@ -184,6 +189,16 @@ class HTTPServerTest(unittest.TestCase):
         self.assertEqual(result["choices"][0]["message"]["content"], "A")
         self.assertEqual(result["choices"][0]["finish_reason"], "stop")
         self.assertEqual(result["usage"]["completion_tokens"], 2)
+        _, _, request_body = self.request("GET", f"/requests/{result['id']}")
+        request_result = json.loads(request_body)
+        self.assertEqual(request_result["phase"], "finished")
+        self.assertIsNone(request_result["timeout_phase"])
+        self.assertGreaterEqual(
+            request_result["timing"]["prefill_seconds"], 0
+        )
+        self.assertGreaterEqual(
+            request_result["timing"]["decode_seconds"], 0
+        )
 
     def test_text_completion_and_sse(self):
         status, _, body = self.request(

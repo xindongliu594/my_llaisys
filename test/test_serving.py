@@ -80,6 +80,23 @@ class BatchedStepModel(StepModel):
         return [int(token) + 1 for token in token_ids]
 
 
+class SlowBatchedStepModel(BatchedStepModel):
+    def __init__(self, prefill_delay=0.0, decode_delay=0.0):
+        super().__init__()
+        self.prefill_delay = prefill_delay
+        self.decode_delay = decode_delay
+
+    def prefill_sequence(self, sequence_id, input_tokens, **kwargs):
+        time.sleep(self.prefill_delay)
+        return super().prefill_sequence(sequence_id, input_tokens, **kwargs)
+
+    def decode_batch(self, sequence_ids, token_ids, sampling_configs):
+        time.sleep(self.decode_delay)
+        return super().decode_batch(
+            sequence_ids, token_ids, sampling_configs
+        )
+
+
 class FakeTokenizer:
     def __init__(self):
         self.conversations = []
@@ -360,6 +377,50 @@ class RoundRobinServingTest(unittest.TestCase):
 
 
 class OrcaServingTest(unittest.TestCase):
+    def test_queue_prefill_and_decode_timeouts_release_sequences(self):
+        queue_model = SlowBatchedStepModel()
+        queue_scheduler = llaisys.OrcaScheduler(
+            queue_model, max_active_requests=1
+        )
+        queue_scheduler.sessions.create("active")
+        queue_scheduler.sessions.create("queued")
+        active = queue_scheduler.submit("active", [1], max_new_tokens=3)
+        queued = queue_scheduler.submit(
+            "queued", [2], max_new_tokens=2, queue_timeout_seconds=0.001
+        )
+        queue_scheduler.step_batch()
+        time.sleep(0.005)
+        queue_scheduler.step_batch()
+        self.assertEqual(queued.finish_reason, llaisys.FinishReason.TIMEOUT)
+        self.assertEqual(queued.timeout_phase, "queue")
+        self.assertEqual(queued.phase, llaisys.RequestPhase.FINISHED)
+        self.assertFalse(queue_scheduler.sessions.get("queued").busy)
+        queue_scheduler.cancel(active.request_id)
+        queue_scheduler.step_batch()
+
+        prefill_model = SlowBatchedStepModel(prefill_delay=0.005)
+        prefill_scheduler = llaisys.OrcaScheduler(prefill_model)
+        prefill_scheduler.sessions.create("prefill")
+        prefill = prefill_scheduler.submit(
+            "prefill", [1], prefill_timeout_seconds=0.001
+        )
+        prefill_scheduler.step_batch()
+        self.assertEqual(prefill.timeout_phase, "prefill")
+        self.assertEqual(prefill.finish_reason, llaisys.FinishReason.TIMEOUT)
+        self.assertNotIn(prefill.request_id, prefill_model.sequences)
+
+        decode_model = SlowBatchedStepModel(decode_delay=0.005)
+        decode_scheduler = llaisys.OrcaScheduler(decode_model)
+        decode_scheduler.sessions.create("decode")
+        decode = decode_scheduler.submit(
+            "decode", [1], max_new_tokens=3, decode_timeout_seconds=0.001
+        )
+        decode_scheduler.step_batch()
+        decode_scheduler.step_batch()
+        self.assertEqual(decode.timeout_phase, "decode")
+        self.assertEqual(decode.finish_reason, llaisys.FinishReason.TIMEOUT)
+        self.assertNotIn(decode.request_id, decode_model.sequences)
+
     def test_dynamic_iteration_batching_and_sequence_cleanup(self):
         model = BatchedStepModel()
         scheduler = llaisys.OrcaScheduler(
