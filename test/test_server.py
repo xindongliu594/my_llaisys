@@ -5,6 +5,7 @@ import urllib.error
 import urllib.request
 
 import llaisys
+from llaisys.benchmark import run_benchmark
 
 
 class ServerModel:
@@ -77,6 +78,31 @@ class HTTPServerTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as raised:
             self.request(method, path, data)
         return raised.exception.code, json.loads(raised.exception.read())
+
+    def test_benchmark_and_percentile_metrics(self):
+        summary = run_benchmark(
+            endpoint=self.base_url,
+            model="test-model",
+            prompt="Benchmark",
+            requests=4,
+            concurrency=2,
+            max_tokens=2,
+            warmup=1,
+            timeout=5,
+        )
+
+        self.assertEqual(summary["successful"], 4)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["output_tokens"], 8)
+        self.assertGreater(summary["requests_per_second"], 0)
+        self.assertGreaterEqual(summary["ttft_seconds"]["p95"], 0)
+
+        _, _, metrics_body = self.request("GET", "/metrics")
+        metrics = metrics_body.decode("utf-8")
+        self.assertIn("llaisys_ttft_seconds_p50", metrics)
+        self.assertIn("llaisys_ttft_seconds_p95", metrics)
+        self.assertIn("llaisys_ttft_seconds_p99", metrics)
+        self.assertIn("llaisys_generated_tokens_per_second", metrics)
 
     def test_context_stop_strings_and_strict_validation(self):
         status, _, body = self.request(

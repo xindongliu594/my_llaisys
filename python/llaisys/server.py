@@ -13,9 +13,10 @@ import math
 import threading
 import time
 import uuid
+from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .serving import (
@@ -37,6 +38,7 @@ class ServingMetrics:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._started_at = time.time()
         self.requests_total = 0
         self.requests_active = 0
         self.requests_completed = 0
@@ -47,7 +49,12 @@ class ServingMetrics:
         self._first_token_at: Dict[str, float] = {}
         self._ttft_sum = 0.0
         self._duration_sum = 0.0
+        self._generation_seconds_sum = 0.0
+        self._completed_generated_tokens = 0
         self._terminal_requests: set[str] = set()
+        self._ttft_samples: Deque[float] = deque(maxlen=10000)
+        self._duration_samples: Deque[float] = deque(maxlen=10000)
+        self._token_rate_samples: Deque[float] = deque(maxlen=10000)
 
     def submitted(self, request: GenerationRequest) -> None:
         with self._lock:
@@ -62,12 +69,26 @@ class ServingMetrics:
                 if request.request_id not in self._first_token_at:
                     now = time.time()
                     self._first_token_at[request.request_id] = now
-                    self._ttft_sum += now - request.created_at
+                    ttft = now - request.created_at
+                    self._ttft_sum += ttft
+                    self._ttft_samples.append(ttft)
             if not event.finished or request.request_id in self._terminal_requests:
                 return
             self._terminal_requests.add(request.request_id)
             self.requests_active = max(0, self.requests_active - 1)
-            self._duration_sum += time.time() - request.created_at
+            now = time.time()
+            duration = now - request.created_at
+            self._duration_sum += duration
+            self._duration_samples.append(duration)
+            first_token_at = self._first_token_at.get(request.request_id)
+            if first_token_at is not None:
+                generation_seconds = max(now - first_token_at, 1e-9)
+                generated_tokens = len(request.generated_tokens)
+                self._generation_seconds_sum += generation_seconds
+                self._completed_generated_tokens += generated_tokens
+                self._token_rate_samples.append(
+                    generated_tokens / generation_seconds
+                )
             if request.status is RequestStatus.FINISHED:
                 self.requests_completed += 1
             elif request.status is RequestStatus.FAILED:
@@ -82,7 +103,8 @@ class ServingMetrics:
                 + self.requests_failed
                 + self.requests_cancelled
             )
-            return {
+            elapsed = max(time.time() - self._started_at, 1e-9)
+            snapshot = {
                 "requests_total": self.requests_total,
                 "requests_active": self.requests_active,
                 "requests_completed": self.requests_completed,
@@ -98,17 +120,51 @@ class ServingMetrics:
                 "mean_request_duration_seconds": (
                     self._duration_sum / terminal if terminal else 0.0
                 ),
+                "requests_per_second": terminal / elapsed,
+                "generated_tokens_per_second": (
+                    self._completed_generated_tokens
+                    / self._generation_seconds_sum
+                    if self._generation_seconds_sum
+                    else 0.0
+                ),
             }
+            for name, samples in (
+                ("ttft_seconds", self._ttft_samples),
+                ("request_duration_seconds", self._duration_samples),
+                ("request_token_rate", self._token_rate_samples),
+            ):
+                for label, quantile in (("p50", 0.50), ("p95", 0.95), ("p99", 0.99)):
+                    snapshot[f"{name}_{label}"] = self._percentile(
+                        samples, quantile
+                    )
+            return snapshot
+
+    @staticmethod
+    def _percentile(samples: Sequence[float], quantile: float) -> float:
+        if not samples:
+            return 0.0
+        ordered = sorted(samples)
+        position = (len(ordered) - 1) * quantile
+        lower = math.floor(position)
+        upper = math.ceil(position)
+        if lower == upper:
+            return float(ordered[lower])
+        weight = position - lower
+        return float(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
 
     def prometheus(self) -> str:
         values = self.snapshot()
         lines = []
+        counters = {
+            "requests_total",
+            "requests_completed",
+            "requests_failed",
+            "requests_cancelled",
+            "prompt_tokens_total",
+            "generated_tokens_total",
+        }
         for name, value in values.items():
-            metric_type = (
-                "gauge"
-                if name.startswith("mean_") or name == "requests_active"
-                else "counter"
-            )
+            metric_type = "counter" if name in counters else "gauge"
             metric_name = f"llaisys_{name}"
             lines.extend(
                 [f"# TYPE {metric_name} {metric_type}", f"{metric_name} {value}"]

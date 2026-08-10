@@ -202,3 +202,30 @@ server.stop(graceful=True, timeout_seconds=30)
 服务首先停止接收新任务并等待在途请求；超过指定时间后才会取消剩余请求，随后释放
 调度工作线程、模型和 HTTP 监听资源。`GET /health` 始终用于进程存活检查，
 `GET /ready` 用于流量接入检查。
+
+## 10. 并发 Benchmark 和百分位指标
+
+启动服务后，可以对 SSE 流式接口发起真实并发请求：
+
+```bash
+python -m llaisys.benchmark \
+  --endpoint http://127.0.0.1:8000 \
+  --model deepseek-r1-qwen-1.5b \
+  --prompt "解释 KV Cache" \
+  --requests 32 \
+  --concurrency 8 \
+  --max-tokens 128 \
+  --warmup 2 \
+  --output benchmark.json
+```
+
+报告包含成功/失败请求数、总墙钟时间、请求吞吐量、输出 Token 吞吐量，以及 TTFT
+和端到端请求时延的 P50、P95、P99。服务端 `/metrics` 同时公开：
+
+- `llaisys_ttft_seconds_p50/p95/p99`；
+- `llaisys_request_duration_seconds_p50/p95/p99`；
+- `llaisys_request_token_rate_p50/p95/p99`；
+- `llaisys_requests_per_second`；
+- `llaisys_generated_tokens_per_second`。
+
+服务端仅保留最近 10000 个样本，避免长期运行时指标样本无限占用内存。
