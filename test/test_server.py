@@ -184,6 +184,26 @@ class HTTPServerTest(unittest.TestCase):
         self.assertIn("chat.completion.chunk", text)
         self.assertIn("data: [DONE]", text)
 
+    def test_z_readiness_and_draining_reject_new_work(self):
+        status, _, body = self.request("GET", "/ready")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["status"], "ready")
+
+        self.server.begin_draining()
+
+        code, error = self.request_error("GET", "/ready", None)
+        self.assertEqual(code, 503)
+        self.assertIn("draining", error["error"]["message"])
+        code, _ = self.request_error(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Rejected"}],
+            },
+        )
+        self.assertEqual(code, 503)
+
     def test_session_crud_request_status_and_metrics(self):
         status, _, body = self.request(
             "POST",

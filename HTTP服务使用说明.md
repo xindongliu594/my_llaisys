@@ -178,3 +178,27 @@ curl http://127.0.0.1:8000/sessions/import \
     "new_session_id": "study-chat-copy"
   }'
 ```
+
+## 9. 容量限制与安全关闭
+
+命令行可以限制等待队列和同时活跃的请求数：
+
+```bash
+python -m llaisys.serve \
+  --model /path/to/model \
+  --device nvidia \
+  --max-queue-size 256 \
+  --max-active-requests 32
+```
+
+等待队列已满时返回 HTTP 429。服务进入排空状态后，`GET /ready` 返回 HTTP 503，
+新的推理请求也返回 503，但已经进入系统的请求会继续执行。Python 嵌入式调用可以
+设置等待上限：
+
+```python
+server.stop(graceful=True, timeout_seconds=30)
+```
+
+服务首先停止接收新任务并等待在途请求；超过指定时间后才会取消剩余请求，随后释放
+调度工作线程、模型和 HTTP 监听资源。`GET /health` 始终用于进程存活检查，
+`GET /ready` 用于流量接入检查。

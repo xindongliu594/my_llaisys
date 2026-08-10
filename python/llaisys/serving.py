@@ -67,6 +67,14 @@ class FinishReason(str, Enum):
     ERROR = "error"
 
 
+class ServiceOverloadedError(RuntimeError):
+    """Raised when the configured waiting queue has reached capacity."""
+
+
+class ServiceUnavailableError(RuntimeError):
+    """Raised when the server is draining or no longer accepting work."""
+
+
 @dataclass
 class GenerationRequest:
     request_id: str
@@ -287,11 +295,14 @@ class RequestPool:
     submission order.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_pending_requests: Optional[int] = None) -> None:
+        if max_pending_requests is not None and max_pending_requests <= 0:
+            raise ValueError("max_pending_requests must be positive")
         self._heap: List[Tuple[int, int, str]] = []
         self._requests: Dict[str, GenerationRequest] = {}
         self._sequence = itertools.count()
         self._lock = threading.RLock()
+        self.max_pending_requests = max_pending_requests
 
     def submit(self, request: GenerationRequest) -> None:
         with self._lock:
@@ -299,6 +310,13 @@ class RequestPool:
                 raise ValueError(f"Request already exists: {request.request_id}")
             if request.status is not RequestStatus.WAITING:
                 raise ValueError("Only waiting requests may enter the request pool")
+            if (
+                self.max_pending_requests is not None
+                and self.pending_count() >= self.max_pending_requests
+            ):
+                raise ServiceOverloadedError(
+                    "Request queue is full; retry after an active request finishes"
+                )
             self._requests[request.request_id] = request
             heapq.heappush(
                 self._heap,
@@ -343,6 +361,13 @@ class RequestPool:
     def requests(self) -> List[GenerationRequest]:
         with self._lock:
             return list(self._requests.values())
+
+    def unfinished_count(self) -> int:
+        with self._lock:
+            return sum(
+                request.status in (RequestStatus.WAITING, RequestStatus.RUNNING)
+                for request in self._requests.values()
+            )
 
 
 class RequestScheduler:
@@ -599,7 +624,10 @@ class RoundRobinScheduler(RequestScheduler):
         sequence_decoder: Optional[Callable[[Sequence[int]], str]] = None,
         commit_partial_on_abort: bool = True,
         max_sequence_length: Optional[int] = None,
+        max_active_requests: Optional[int] = None,
     ) -> None:
+        if max_active_requests is not None and max_active_requests <= 0:
+            raise ValueError("max_active_requests must be positive")
         super().__init__(
             model,
             sessions=sessions,
@@ -616,6 +644,7 @@ class RoundRobinScheduler(RequestScheduler):
         self._sequence_decoder = sequence_decoder
         self._commit_partial_on_abort = commit_partial_on_abort
         self._eos_token_id = getattr(model, "eos_token_id", None)
+        self.max_active_requests = max_active_requests
 
     def submit(
         self,
@@ -835,6 +864,15 @@ class RoundRobinScheduler(RequestScheduler):
         while self.step() is not None:
             pass
 
+    def wait_until_idle(self, timeout: Optional[float] = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.request_pool.unfinished_count():
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            self._wake_event.set()
+            self._stop_event.wait(0.01)
+        return True
+
     def _worker_loop(self) -> None:
         while not self._stop_event.is_set():
             event = self.step()
@@ -844,6 +882,11 @@ class RoundRobinScheduler(RequestScheduler):
 
     def _admit_waiting(self) -> None:
         while True:
+            if (
+                self.max_active_requests is not None
+                and len(self._active) >= self.max_active_requests
+            ):
+                return
             request = self.request_pool.pop_next()
             if request is None:
                 return

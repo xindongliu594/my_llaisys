@@ -23,8 +23,11 @@ from .serving import (
     ChatService,
     FinishReason,
     GenerationRequest,
+    RequestPool,
     RequestStatus,
     RoundRobinScheduler,
+    ServiceOverloadedError,
+    ServiceUnavailableError,
     TokenEvent,
 )
 
@@ -134,6 +137,8 @@ class OpenAIAPIServer:
         self.metrics = ServingMetrics()
         self._httpd = _Server((host, port), self._handler_type())
         self._thread: Optional[threading.Thread] = None
+        self._lifecycle_lock = threading.RLock()
+        self._accepting_requests = False
 
     @property
     def address(self) -> Tuple[str, int]:
@@ -142,6 +147,8 @@ class OpenAIAPIServer:
 
     def start(self) -> None:
         self.scheduler.start()
+        with self._lifecycle_lock:
+            self._accepting_requests = True
         if self._thread is not None and self._thread.is_alive():
             return
         self._thread = threading.Thread(
@@ -153,14 +160,41 @@ class OpenAIAPIServer:
 
     def serve_forever(self) -> None:
         self.scheduler.start()
+        with self._lifecycle_lock:
+            self._accepting_requests = True
         self._httpd.serve_forever()
 
-    def stop(self) -> None:
+    def begin_draining(self) -> None:
+        with self._lifecycle_lock:
+            self._accepting_requests = False
+
+    def stop(
+        self, graceful: bool = True, timeout_seconds: float = 30.0
+    ) -> bool:
+        self.begin_draining()
         self._httpd.shutdown()
+        drained = (
+            self.scheduler.wait_until_idle(timeout_seconds) if graceful else False
+        )
+        if not drained:
+            self.scheduler.cancel_all()
+            self.scheduler.wait_until_idle(timeout=1.0)
         self._httpd.server_close()
         if self._thread is not None:
             self._thread.join()
         self.scheduler.stop()
+        return drained
+
+    @property
+    def accepting_requests(self) -> bool:
+        with self._lifecycle_lock:
+            return self._accepting_requests
+
+    def _ensure_accepting(self) -> None:
+        if not self.accepting_requests:
+            raise ServiceUnavailableError(
+                "Server is draining and no longer accepts new requests"
+            )
 
     def _handler_type(self):
         owner = self
@@ -187,7 +221,19 @@ class OpenAIAPIServer:
             parsed = urlparse(handler.path)
             path = parsed.path
             if path == "/health":
-                self._json(handler, HTTPStatus.OK, {"status": "ok"})
+                self._json(
+                    handler,
+                    HTTPStatus.OK,
+                    {
+                        "status": "ok",
+                        "accepting_requests": self.accepting_requests,
+                    },
+                )
+                return
+            if path == "/ready":
+                if not self.accepting_requests:
+                    raise ServiceUnavailableError("Server is draining")
+                self._json(handler, HTTPStatus.OK, {"status": "ready"})
                 return
             if path == "/v1/models":
                 self._json(
@@ -283,6 +329,9 @@ class OpenAIAPIServer:
         try:
             path = urlparse(handler.path).path
             body = self._read_json(handler)
+            is_cancel = path.startswith("/requests/") and path.endswith("/cancel")
+            if not is_cancel:
+                self._ensure_accepting()
             if path == "/v1/chat/completions":
                 self._chat_completion(handler, body)
                 return
@@ -847,7 +896,11 @@ class OpenAIAPIServer:
     def _exception(
         self, handler: BaseHTTPRequestHandler, error: Exception
     ) -> None:
-        if isinstance(error, KeyError):
+        if isinstance(error, ServiceOverloadedError):
+            status = HTTPStatus.TOO_MANY_REQUESTS
+        elif isinstance(error, ServiceUnavailableError):
+            status = HTTPStatus.SERVICE_UNAVAILABLE
+        elif isinstance(error, KeyError):
             status = HTTPStatus.NOT_FOUND
         elif isinstance(error, (ValueError, TypeError)):
             status = HTTPStatus.BAD_REQUEST
@@ -875,6 +928,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-id", default=None)
+    parser.add_argument("--max-queue-size", type=int, default=256)
+    parser.add_argument("--max-active-requests", type=int, default=32)
     args = parser.parse_args(argv)
 
     # Imported lazily so importing llaisys.server does not require transformers.
@@ -888,7 +943,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.model, trust_remote_code=True
     )
     model = Qwen2(args.model, device)
-    scheduler = RoundRobinScheduler(model)
+    request_pool = RequestPool(max_pending_requests=args.max_queue_size)
+    scheduler = RoundRobinScheduler(
+        model,
+        request_pool=request_pool,
+        max_active_requests=args.max_active_requests,
+    )
     chat = ChatService(scheduler, tokenizer)
     server = OpenAIAPIServer(
         chat,

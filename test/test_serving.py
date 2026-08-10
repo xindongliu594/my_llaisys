@@ -79,6 +79,18 @@ class FakeTokenizer:
 
 
 class ServingTest(unittest.TestCase):
+    def test_request_pool_capacity_releases_rejected_session(self):
+        pool = llaisys.RequestPool(max_pending_requests=1)
+        scheduler = llaisys.RequestScheduler(FakeModel(), request_pool=pool)
+        scheduler.sessions.create("first")
+        scheduler.sessions.create("rejected")
+        scheduler.submit("first", [1])
+
+        with self.assertRaises(llaisys.ServiceOverloadedError):
+            scheduler.submit("rejected", [2])
+
+        self.assertFalse(scheduler.sessions.get("rejected").busy)
+
     def test_context_limit_rejects_or_left_truncates(self):
         model = LimitedModel()
         scheduler = llaisys.RequestScheduler(model)
@@ -169,6 +181,22 @@ class ServingTest(unittest.TestCase):
 
 
 class RoundRobinServingTest(unittest.TestCase):
+    def test_active_request_limit_keeps_excess_work_waiting(self):
+        scheduler = llaisys.RoundRobinScheduler(
+            StepModel(), max_active_requests=1
+        )
+        scheduler.sessions.create("active", initial_tokens=[1])
+        scheduler.sessions.create("queued", initial_tokens=[2])
+        active = scheduler.submit("active", [], max_new_tokens=2)
+        queued = scheduler.submit("queued", [], max_new_tokens=1)
+
+        scheduler.step()
+
+        self.assertEqual(active.status, llaisys.RequestStatus.RUNNING)
+        self.assertEqual(queued.status, llaisys.RequestStatus.WAITING)
+        list(scheduler.run_until_idle_stream())
+        self.assertEqual(queued.status, llaisys.RequestStatus.FINISHED)
+
     def test_stop_string_can_span_tokens_without_leaking_prefix(self):
         pieces = {10: "answer<", 11: "END>", 12: "ignored"}
         scheduler = llaisys.RoundRobinScheduler(
