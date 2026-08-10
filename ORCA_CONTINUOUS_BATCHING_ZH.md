@@ -76,5 +76,8 @@ python -m llaisys.serve \
 2. Fake Batched Model 验证动态加入、退出、Batch 大小变化和 Cache 释放；
 3. CPU 全套回归验证旧单序列接口不变；
 4. NVIDIA 服务器验证 CUDA 编译、真实 1.5B 模型一致性和并发性能；
-5. 使用 `python -m llaisys.benchmark` 对比 Round-Robin 与 Orca 的 TTFT、吞吐量和
-   P50/P95/P99。
+5. 使用 `python -m llaisys.compare_schedulers` 在相同模型、请求和并发条件下对比
+   Round-Robin 与 Orca 的 TTFT、吞吐量和 P50/P95/P99。
+
+RTX 5090 的真实模型复现命令与结果见
+[ORCA_5090_BENCHMARK_ZH.md](ORCA_5090_BENCHMARK_ZH.md)。
