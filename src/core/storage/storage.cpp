@@ -4,10 +4,17 @@
 
 namespace llaisys::core {
 Storage::Storage(std::byte *memory, size_t size, Runtime &runtime, bool is_host)
-    : _memory(memory), _size(size), _runtime(runtime), _is_host(is_host) {}
+    : _memory(memory), _size(size), _api(runtime.api()),
+      _device_type(runtime.deviceType()), _device_id(runtime.deviceId()),
+      _is_host(is_host) {}
 
 Storage::~Storage() {
-    _runtime.freeStorage(this);
+    if (_is_host) {
+        _api->free_host(_memory);
+    } else {
+        _api->set_device(_device_id);
+        _api->free_device(_memory);
+    }
 }
 
 std::byte *Storage::memory() const {
@@ -22,7 +29,7 @@ llaisysDeviceType_t Storage::deviceType() const {
     if (isHost()) {
         return LLAISYS_DEVICE_CPU;
     } else {
-        return _runtime.deviceType();
+        return _device_type;
     }
 }
 
@@ -30,7 +37,7 @@ int Storage::deviceId() const {
     if (isHost()) {
         return 0;
     } else {
-        return _runtime.deviceId();
+        return _device_id;
     }
 }
 
