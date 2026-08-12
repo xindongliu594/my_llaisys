@@ -19,10 +19,63 @@
 | 1.5B 模型端到端推理 | 通过 | 通过 | 通过 |
 | 与 PyTorch 贪心解码结果一致 | 通过 | 通过 | 通过 |
 
+## 功能完善
+
+在完成作业 #0 至 #4 的基础功能后，项目进一步补齐了单机大模型推理服务所需的请求调度、会话管理、可靠性保护、可观测性和压力测试能力。模型计算与采样逻辑仍由 LLAISYS C/C++/CUDA 后端完成，Python 层负责接口包装、请求管理和服务调度。
+
+### 推理接口与生成控制
+
+- 提供 OpenAI 风格的 Chat Completion 和 Text Completion 接口，同时支持非流式响应与 SSE 流式输出。
+- 支持 Argmax、Top-K、Top-P、Temperature、Repetition Penalty 和随机种子控制。
+- 支持 `min_tokens`、`ignore_eos`、Stop Token ID 和可跨 Token 匹配的 Stop 字符串。
+- 提供 Tokenize、Detokenize、请求结果查询和主动取消接口。
+- C++ 后端可按请求返回选中 Token 的 Logprob 和 Top-N Logprobs，未请求时不执行完整词表的数据回传。
+
+### 请求池、会话与调度
+
+- 实现带优先级、队列容量、排队超时和活跃请求上限的请求池，并提供 429 过载响应。
+- 实现内存会话的创建、查询、列表、删除、导入和导出，同一会话只允许一个在途请求。
+- 实现 Orca 迭代级调度、Selective Batching 和动态 Continuous Batching，请求可在每次模型迭代边界加入或退出执行批次。
+- 为每个活跃序列维护独立且持久的 KV Cache，Decode 阶段只处理新 Token；请求完成、取消、超时或失败后立即释放对应 Sequence 与 KV Cache。
+- 保留 Round-Robin 基线路径，用于在相同模型、输入和并发条件下与 Orca 调度进行对照测试。
+
+### 可靠性与资源保护
+
+- 对模型上下文长度和生成参数进行严格校验，并支持可选的左侧上下文截断。
+- 分别实现总超时、排队超时、Prefill 超时和 Decode 超时；SSE 客户端断开后自动取消请求。
+- 根据模型层数、KV Head、Head Dimension、数据类型和序列容量精确估算 KV Cache，支持显存预算、高水位拒绝和资源预留统计。
+- 将单请求后端异常或 OOM 隔离在对应请求或批次内，释放资源后继续运行调度线程。
+- 支持服务 Drain、503 服务不可用响应和安全关闭，避免关闭过程中遗留请求和 KV Cache。
+
+### 可观测性与验证工具
+
+- `/metrics` 提供 Prometheus 格式指标，包括请求状态、Token 吞吐、活跃 Sequence、KV Cache 使用量、后端错误/OOM 和 Orca Batch 大小。
+- 统计 TTFT、端到端耗时、Queue、Prefill、Decode 和单请求 Token Rate 的 P50/P95/P99。
+- 每个终止请求记录结构化 JSON 日志，包括请求/会话 ID、结束原因、Token 数量、各阶段耗时和错误信息。
+- 提供普通并发 Benchmark、Round-Robin/Orca 对照 Benchmark、混合长度与主动取消压力测试，以及按时间运行的稳定性测试。
+- 压力测试结束后自动检查活跃 Sequence 和 KV Cache 预留/分配是否归零，用于发现资源泄漏。
+
+### RTX 5090 功能与性能验证
+
+在单张 NVIDIA RTX 5090 上使用 `DeepSeek-R1-Distill-Qwen-1.5B` 完成真实模型验证。多序列 Orca 路径生成的 Token 与原单序列路径一致，动态 Decode Batch 最大值与并发数 4 一致。在 8 个请求、并发数 4、每请求生成 32 Token 的相同条件下，测试结果如下：
+
+| 指标 | Round-Robin | Orca Continuous Batching | 变化 |
+| --- | ---: | ---: | ---: |
+| 请求吞吐 | 3.052 req/s | 10.365 req/s | 3.397 倍 |
+| 输出 Token 吞吐 | 97.651 token/s | 331.693 token/s | 3.397 倍 |
+| TTFT P50 | 38.09 ms | 24.96 ms | 降低 34.5% |
+| 请求耗时 P50 | 1299.17 ms | 376.87 ms | 降低 71.0% |
+
+另一组 12 请求、并发数 4、主动取消比例 25% 的混合负载回归中，8 个请求正常完成、4 个请求按计划取消、0 个请求失败；测试结束后活跃 Sequence、KV Cache 预留和分配均归零。上述结果用于验证功能、调度正确性和资源回收，不代表 RTX 5090 的极限性能或生产容量。
+
+详细设计、接口、复现命令和完整测试结果见 `SERVING_DESIGN_ZH.md`、`ORCA_CONTINUOUS_BATCHING_ZH.md`、`ORCA_5090_BENCHMARK_ZH.md` 和 `大模型推理服务系统说明.md`。
+
 ## 已知限制
 
-- 当前 Qwen2 后端按照作业要求实现贪心解码，不支持 Top-k、Top-p 等随机采样。
+- 当前 Qwen2 后端已支持常用采样策略，但功能验证和与 PyTorch 的一致性测试仍按照作业要求使用确定性 Argmax。
 - 当前模型后端仅支持单设备推理，尚未实现张量并行或流水线并行。
+- KV Cache 当前按 Sequence 使用连续内存，尚未实现 Paged KV Cache 或 Prefix Cache；变长 Self-Attention 仍按序列调用，尚未融合为统一的变长 Attention Kernel。
+- 会话数据保存在内存中，服务进程重启后需要通过会话导入接口恢复。
 - 公共 GitHub Actions 使用 CPU Runner，因此 GPU Runtime、算子和模型推理由对应的真实算力平台手工验证，验证命令和结果记录在本报告中。
 - RTX 5090 使用完整 GPU，而 MetaX C500 使用 50% 计算资源切片，因此跨平台绝对延迟不构成等资源硬件性能比较；平台内相对于 PyTorch 的加速比更具参考意义。
 
